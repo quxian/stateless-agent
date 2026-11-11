@@ -1,5 +1,11 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { createWorkspaceTools, runAgent } from "./stateless-agent.ts";
+import {
+  createBashTool,
+  createEditTool,
+  createReadTool,
+  createWriteTool,
+  runAgent,
+} from "./stateless-agent.ts";
 
 const client = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY || 'zys-test',
@@ -7,7 +13,12 @@ const client = new Anthropic({
 });
 
 const workspace = process.cwd();
-const tools = createWorkspaceTools(workspace);
+const tools = [
+  createReadTool(workspace),
+  createWriteTool(workspace),
+  createEditTool(workspace),
+  createBashTool(workspace),
+];
 
 const result = await runAgent({
   client,
