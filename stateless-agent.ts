@@ -352,13 +352,7 @@ const TOOL_SUMMARY_MAX_CHARS = 500;
 /** 历史中存在未配对 `tool_use`（如上次运行中断）时，自动补造的错误态 `tool_result` 说明文案。 */
 const RECOVERY_RESULT_TEXT = "从上次未完成的运行中恢复：该工具调用的执行状态未知。";
 
-/**
- * 按最大 UTF-16 码元长度安全截断字符串，避免在截断处切开代理对（如 Emoji 或生僻汉字）留下孤立高位代理项。
- *
- * @param str 待截断的原始字符串。
- * @param maxChars 允许保留的最大 UTF-16 码元数。
- * @returns 截断后的合法 UTF-16 字符串。
- */
+/** 按最大 UTF-16 码元长度安全截断字符串，避免在截断处切开代理对留下孤立高位代理项。 */
 function sliceStringSafe(str: string, maxChars: number): string {
   if (str.length <= maxChars) return str;
   let end = maxChars;
@@ -374,128 +368,83 @@ function sliceStringSafe(str: string, maxChars: number): string {
  * `system` 消息不属于任何回合，也不打断前后相邻同角色消息的回合合并。
  */
 interface ConversationTurn {
-  /** 该回合的消息角色（如 `"user"` 或 `"assistant"`）。 */
-  role: Anthropic.Beta.Messages.BetaMessageParam["role"];
-  /** 该回合包含的消息在原始消息数组中的下标列表（按出现顺序排列）。 */
-  indices: number[];
+  /** 该回合的消息角色（`"user"` 或 `"assistant"`）。 */
+  role: Exclude<Anthropic.Beta.Messages.BetaMessageParam["role"], "system">;
+  /** 该回合首条消息在原始消息数组中的下标。 */
+  firstIndex: number;
+  /** 该回合末条消息在原始消息数组中的下标。 */
+  lastIndex: number;
+  /** 该回合内全部 `tool_use` 块的唯一 ID 集合（保持首次出现顺序）。 */
+  toolUseIds: Set<string>;
+  /** 该回合内全部 `tool_result` 块所关联的 `tool_use_id` 集合。 */
+  toolResultIds: Set<string>;
 }
 
-/**
- * 将消息数组按 Anthropic API 语义归并为交替的对话回合列表（忽略 `system` 消息且不因其打断回合）。
- *
- * @param messages 待分组的消息列表。
- * @returns 按时间顺序排列的对话回合数组。
- */
+/** 将消息数组按 API 语义单趟归并为交替的对话回合列表（忽略 `system` 消息），并同步收集各回合的工具调用与结果 ID。 */
 function groupIntoTurns(messages: readonly Anthropic.Beta.Messages.BetaMessageParam[]): ConversationTurn[] {
   const turns: ConversationTurn[] = [];
   for (let i = 0; i < messages.length; i++) {
-    const role = messages[i].role;
-    if (role === "system") continue;
-    const last = turns[turns.length - 1];
-    if (last && last.role === role) last.indices.push(i);
-    else turns.push({ role, indices: [i] });
+    const msg = messages[i];
+    if (msg.role === "system") continue;
+    let turn = turns[turns.length - 1];
+    if (!turn || turn.role !== msg.role) {
+      turn = {
+        role: msg.role,
+        firstIndex: i,
+        lastIndex: i,
+        toolUseIds: new Set(),
+        toolResultIds: new Set(),
+      };
+      turns.push(turn);
+    } else {
+      turn.lastIndex = i;
+    }
+    if (Array.isArray(msg.content)) {
+      for (const b of msg.content) {
+        if (b.type === "tool_use") turn.toolUseIds.add(b.id);
+        else if (b.type === "tool_result") turn.toolResultIds.add(b.tool_use_id);
+      }
+    }
   }
   return turns;
 }
 
-/**
- * 按出现顺序收集一个回合内全部 `tool_use` 内容块的唯一 ID（自动去重）。
- *
- * @param messages 完整消息列表。
- * @param indices 当前 `assistant` 回合所包含的消息下标数组。
- * @returns 去重后保持首次出现顺序的 `tool_use` ID 列表。
- */
-function collectToolUseIds(messages: readonly Anthropic.Beta.Messages.BetaMessageParam[], indices: number[]): string[] {
-  const ids = new Set<string>();
-  for (const idx of indices) {
-    const content = messages[idx].content;
-    if (!Array.isArray(content)) continue;
-    for (const b of content) {
-      if (b.type === "tool_use") ids.add(b.id);
-    }
-  }
-  return [...ids];
+/** 构造单个标记为错误（`is_error: true`）的 `tool_result` 内容块。 */
+function makeErrorToolResult(
+  toolUseId: string,
+  content: string
+): Anthropic.Beta.Messages.BetaToolResultBlockParam {
+  return { type: "tool_result", tool_use_id: toolUseId, is_error: true, content };
+}
+
+/** 为一组缺失结果的 `tool_use` ID 批量生成“执行状态未知”的错误态恢复结果块。 */
+function makeRecoveryResults(ids: Iterable<string>): Anthropic.Beta.Messages.BetaToolResultBlockParam[] {
+  return Array.from(ids, (id) => makeErrorToolResult(id, RECOVERY_RESULT_TEXT));
 }
 
 /**
- * 收集一个回合内全部 `tool_result` 内容块所关联的 `tool_use_id` 集合。
- *
- * @param messages 完整消息列表。
- * @param indices 当前 `user` 回合所包含的消息下标数组。
- * @returns 已覆盖的 `tool_use_id` 集合。
- */
-function collectToolResultIds(messages: readonly Anthropic.Beta.Messages.BetaMessageParam[], indices: number[]): Set<string> {
-  const ids = new Set<string>();
-  for (const idx of indices) {
-    const content = messages[idx].content;
-    if (!Array.isArray(content)) continue;
-    for (const b of content) {
-      if (b.type === "tool_result") ids.add(b.tool_use_id);
-    }
-  }
-  return ids;
-}
-
-/**
- * 为一组缺失结果的 `tool_use` ID 批量生成“执行状态未知”的错误态恢复结果块。
- *
- * @param ids 缺失 `tool_result` 的 `tool_use` ID 列表。
- * @returns 标记为 `is_error: true` 的 `tool_result` 内容块数组。
- */
-function makeRecoveryResults(ids: string[]): Anthropic.Beta.Messages.BetaToolResultBlockParam[] {
-  return ids.map((id) => ({
-    type: "tool_result" as const,
-    tool_use_id: id,
-    is_error: true,
-    content: RECOVERY_RESULT_TEXT,
-  }));
-}
-
-/**
- * 末尾恢复：若历史以 `assistant` 回合结束（可能由多条连续 `assistant` 消息组成）且其中含有 `tool_use`，
- * 为该回合内全部 `tool_use` 补造一条“状态未知”的 `user` 结果消息；否则返回 `null`。
- * 该消息在 `runAgent` 启动时通过 `appendMessage` 写入历史并持久化。
- *
- * @param messages 当前完整历史消息数组。
- * @returns 需要追加到末尾的恢复消息，无需恢复时返回 `null`。
+ * 末尾恢复：若历史以含 `tool_use` 的 `assistant` 回合结束，为该回合全部 `tool_use` 补造一条“状态未知”的 `user` 消息；
+ * 否则返回 `null`。该消息在 `runAgent` 启动时通过 `appendMessage` 写入历史并持久化。
  */
 function buildTrailingRecoveryMessage(
   messages: Anthropic.Beta.Messages.BetaMessageParam[]
 ): Anthropic.Beta.Messages.BetaMessageParam | null {
   const turns = groupIntoTurns(messages);
   const lastTurn = turns[turns.length - 1];
-  if (!lastTurn || lastTurn.role !== "assistant") return null;
-
-  const toolUseIds = collectToolUseIds(messages, lastTurn.indices);
-  if (toolUseIds.length === 0) return null;
-
-  return { role: "user", content: makeRecoveryResults(toolUseIds) };
+  if (!lastTurn || lastTurn.role !== "assistant" || lastTurn.toolUseIds.size === 0) return null;
+  return { role: "user", content: makeRecoveryResults(lastTurn.toolUseIds) };
 }
 
-/**
- * 检测消息列表中是否有任意内容块已显式配置了 `cache_control` 缓存断点。
- *
- * @param messages 待检查的消息列表。
- * @returns 若任一内容块带有非空 `cache_control` 则返回 `true`，否则返回 `false`。
- */
+/** 检测消息列表中是否有任意内容块已显式配置了非空的 `cache_control` 缓存断点。 */
 function messagesHaveCacheControl(messages: readonly Anthropic.Beta.Messages.BetaMessageParam[]): boolean {
-  for (const msg of messages) {
-    if (!Array.isArray(msg.content)) continue;
-    for (const block of msg.content) {
-      if ("cache_control" in block && block.cache_control) return true;
-    }
-  }
-  return false;
+  return messages.some(
+    (msg) =>
+      Array.isArray(msg.content) &&
+      msg.content.some((block) => "cache_control" in block && Boolean(block.cache_control))
+  );
 }
 
-/**
- * 深度比较两个值在结构语义上是否相等（忽略值为 `undefined` 的属性与对象属性顺序），
- * 用于校验 `prepareMessages` 是否原样保留了进行中的工具回合。
- *
- * @param a 待比较的第一个值。
- * @param b 待比较的第二个值。
- * @returns 结构语义一致时返回 `true`，否则返回 `false`。
- */
+/** 深度比较两个值在结构语义上是否相等（忽略值为 `undefined` 的属性与对象键顺序），用于校验进行中工具回合是否被篡改。 */
 function structurallyEqual(a: unknown, b: unknown): boolean {
   if (Object.is(a, b)) return true;
   if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
@@ -507,32 +456,15 @@ function structurallyEqual(a: unknown, b: unknown): boolean {
   return ka.length === kb.length && ka.every((k) => Object.hasOwn(rb, k) && structurallyEqual(ra[k], rb[k]));
 }
 
-/**
- * 提取历史中“进行中的工具回合”消息切片：当最后一个 `assistant` 回合含 `tool_use` 时，
- * 返回从该回合首条消息到历史末尾的全部消息；否则返回空数组。
- *
- * @param messages 完整会话历史。
- * @returns 必须在 `prepareMessages` 返回结果末尾原样保留的消息切片。
- */
+/** 提取历史中“进行中的工具回合”切片：若最后一个 `assistant` 回合含 `tool_use`，返回从其首条消息到历史末尾的消息切片。 */
 function inProgressToolTurn(
   messages: readonly Anthropic.Beta.Messages.BetaMessageParam[]
 ): Anthropic.Beta.Messages.BetaMessageParam[] {
-  const turns = groupIntoTurns(messages);
-  for (let t = turns.length - 1; t >= 0; t--) {
-    if (turns[t].role !== "assistant") continue;
-    if (collectToolUseIds(messages, turns[t].indices).length === 0) return [];
-    return messages.slice(turns[t].indices[0]);
-  }
-  return [];
+  const lastAssistant = groupIntoTurns(messages).reverse().find((t) => t.role === "assistant");
+  return lastAssistant && lastAssistant.toolUseIds.size > 0 ? messages.slice(lastAssistant.firstIndex) : [];
 }
 
-/**
- * 校验 `prepareMessages` 的返回值是否合法（必须为非空数组，且末尾原样保留进行中的工具回合）；
- * 校验失败时抛错，由主循环包装为 `AgentRunError`。
- *
- * @param prepared `prepareMessages` 返回的候选消息数组。
- * @param history 当前完整会话历史。
- */
+/** 校验 `prepareMessages` 返回值为非空数组且末尾原样保留了进行中的工具回合；不合法时抛错并由主循环包装为 `AgentRunError`。 */
 function validatePreparedMessages(
   prepared: unknown,
   history: readonly Anthropic.Beta.Messages.BetaMessageParam[]
@@ -550,19 +482,17 @@ function validatePreparedMessages(
 }
 
 /**
- * 断言每个 `tool_result` 都对应紧邻其前的 `assistant` 回合中的 `tool_use`；否则 API 会拒绝请求。
- * 这里提前抛出指明具体 `tool_use_id` 的错误，而不是悄悄删除（裁剪策略属于宿主）。缺失结果的补全由 `buildApiRequestMessages` 负责。
- *
- * @param messages 本轮准备发往 API 的消息列表。
+ * 断言每个 `tool_result` 都对应紧邻其前的 `assistant` 回合中的 `tool_use`；
+ * 孤立结果会提前抛出指明具体 `tool_use_id` 的错误，而不是悄悄删除（裁剪策略属于宿主；缺失结果的补全由 `buildApiRequestMessages` 负责）。
  */
 function assertToolResultsPaired(messages: readonly Anthropic.Beta.Messages.BetaMessageParam[]): void {
   const turns = groupIntoTurns(messages);
   for (let t = 0; t < turns.length; t++) {
     if (turns[t].role !== "user") continue;
     const prev = turns[t - 1];
-    const known = new Set(prev?.role === "assistant" ? collectToolUseIds(messages, prev.indices) : []);
-    for (const id of collectToolResultIds(messages, turns[t].indices)) {
-      if (!known.has(id)) {
+    const known = prev?.role === "assistant" ? prev.toolUseIds : undefined;
+    for (const id of turns[t].toolResultIds) {
+      if (!known?.has(id)) {
         throw new Error(
           `请求消息中包含 tool_use_id 为 '${id}' 的 tool_result，但紧邻其前缺少包含对应 tool_use 的 assistant 回合。裁剪历史时请成对删除 tool_use 与 tool_result。`
         );
@@ -578,10 +508,6 @@ function assertToolResultsPaired(messages: readonly Anthropic.Beta.Messages.Beta
  *   （保证 `tool_result` 位于普通文本之前）；否则在该 `assistant` 回合之后插入一条新的 `user` 消息；
  * - 不合并、不拆分调用方的消息，不改动任何内容块（`thinking` 及其签名原样透传），`system` 消息原样保留；
  * - 当 `addCacheBreakpoint` 为 `true` 时，在最后一条非临时消息的可缓存末尾块上附加 `ephemeral` 缓存断点。
- *
- * @param messages 经校验的本轮请求消息列表。
- * @param addCacheBreakpoint 是否在末尾消息的最后一个可缓存内容块上自动添加默认缓存断点。
- * @returns 可直接发送给 Anthropic API 的深/浅隔离消息副本。
  */
 function buildApiRequestMessages(
   messages: Anthropic.Beta.Messages.BetaMessageParam[],
@@ -593,20 +519,17 @@ function buildApiRequestMessages(
 
   for (let t = 0; t < turns.length; t++) {
     const turn = turns[t];
-    if (turn.role !== "assistant") continue;
-    const toolUseIds = collectToolUseIds(messages, turn.indices);
-    if (toolUseIds.length === 0) continue;
+    if (turn.role !== "assistant" || turn.toolUseIds.size === 0) continue;
 
     const nextTurn = turns[t + 1]; // 角色交替，存在时必为 user 回合
-    const covered = nextTurn ? collectToolResultIds(messages, nextTurn.indices) : new Set<string>();
-    const missingIds = toolUseIds.filter((id) => !covered.has(id));
+    const missingIds = [...turn.toolUseIds].filter((id) => !nextTurn?.toolResultIds.has(id));
     if (missingIds.length === 0) continue;
 
     const synthetic = makeRecoveryResults(missingIds);
     if (nextTurn) {
-      prependByIndex.set(nextTurn.indices[0], synthetic);
+      prependByIndex.set(nextTurn.firstIndex, synthetic);
     } else {
-      insertAfterIndex.set(turn.indices[turn.indices.length - 1], synthetic);
+      insertAfterIndex.set(turn.lastIndex, synthetic);
     }
   }
 
@@ -660,42 +583,8 @@ function buildApiRequestMessages(
 }
 
 /**
- * 让异步 Promise 与 `AbortSignal` 竞速：若信号已取消或在等待期间触发取消，立即以 `signal.reason` 拒绝，
- * 同时屏蔽原 Promise 后续可能出现的未捕获拒绝，并在结算后清理事件监听。
- *
- * @template T 原 Promise 的解析值类型。
- * @param promise 待竞速的目标异步任务。
- * @param signal 可选的取消信号。
- * @returns 随目标任务完成或随取消信号立即拒绝的 Promise。
- */
-function raceWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
-  promise.catch(() => {});
-  if (!signal) return promise;
-  if (signal.aborted) return Promise.reject(signal.reason);
-
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = () => reject(signal.reason);
-    signal.addEventListener("abort", onAbort, { once: true });
-    promise.then(
-      (val) => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(val);
-      },
-      (err) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(err);
-      }
-    );
-  });
-}
-
-/**
  * 按抛出的错误本身判断是否由取消信号导致，而不是仅看 `catch` 时 `signal` 是否已取消：
  * 工具已得到确定结果（如命令以非零码退出或参数校验失败）后才到达的取消，不能把真实失败改报为中断。
- *
- * @param err 捕获到的未知异常值。
- * @param signal 当前运行的取消信号。
- * @returns 确认异常由该取消信号引起时返回 `true`，否则返回 `false`。
  */
 function isAbortCausedError(err: unknown, signal?: AbortSignal): boolean {
   if (!signal?.aborted) return false;
@@ -705,29 +594,16 @@ function isAbortCausedError(err: unknown, signal?: AbortSignal): boolean {
   return e?.name === "AbortError" || (e?.cause !== undefined && Object.is(e.cause, signal.reason));
 }
 
-/**
- * 类型守卫：判断工具返回值是否为结构化的 `AgentToolResult`。
- * `ToolOutput` 只可能是字符串、数组或 `undefined`，因此“带 `content` 属性的普通非空对象”可无歧义地识别为结构化结果。
- *
- * @param value 工具 `run` 函数返回的值。
- * @returns 为 `AgentToolResult` 结构时返回 `true`。
- */
+/** 类型守卫：判断工具返回值是否为结构化的 `AgentToolResult`（`ToolOutput` 仅可能为字符串、数组或 `undefined`，带 `content` 的非数组对象无歧义）。 */
 function isAgentToolResult(value: unknown): value is AgentToolResult {
   return typeof value === "object" && value !== null && !Array.isArray(value) && "content" in value;
 }
 
-/**
- * 将工具输出生成适合放入 `tool_end.outputSummary` 观察事件的简短文本摘要（最长 `TOOL_SUMMARY_MAX_CHARS` 字符）。
- * 数组型输出中的图片块会被替换为媒体类型说明，避免将庞大的 Base64 图像数据塞入事件流。
- *
- * @param output 工具返回给模型的 `ToolOutput` 内容。
- * @returns 安全截断后的摘要字符串。
- */
+/** 将工具输出生成适合放入 `tool_end.outputSummary` 的简短文本摘要（图片块仅保留媒体类型说明，避免塞入 Base64 数据）。 */
 function summarizeToolOutput(output: ToolOutput): string {
   if (output === undefined || output === null) return "";
   if (typeof output === "string") return sliceStringSafe(output, TOOL_SUMMARY_MAX_CHARS);
   try {
-    // 图片块只保留类型说明，避免把 Base64 数据塞进观察事件
     const summary = output.map((block) =>
       block.type === "image"
         ? { type: "text", text: `[图片: ${block.source.type === "base64" ? block.source.media_type : block.source.type}]` }
@@ -743,18 +619,47 @@ function summarizeToolOutput(output: ToolOutput): string {
 // 3. 核心 Agent 执行函数（流式请求、串行工具执行与主循环）
 // ============================================================================
 
-/**
- * 惰性观察事件发射器类型：接收一个按需构造 `AgentEvent` 的工厂函数，
- * 仅在存在 `onEvent` 订阅者时才求值并派发，避免无订阅者时产生深拷贝或摘要序列化开销。
- */
+/** `runAgent` 主循环内部专用取消控制流信令，用于将各阶段的取消检查统一收敛至外层出口。 */
+class RunAborted {}
+
+/** 在取消信号保护下执行宿主钩子：启动前、等待期间、返回时或抛错后若信号已触发，统一抛出 `RunAborted` 并清理监听。 */
+async function runAbortable<T>(fn: () => Promise<T> | T, signal?: AbortSignal): Promise<T> {
+  if (signal?.aborted) throw new RunAborted();
+  if (!signal) return await fn();
+
+  const promise = Promise.resolve().then(fn);
+  promise.catch(() => {});
+
+  try {
+    const result = await new Promise<T>((resolve, reject) => {
+      const onAbort = () => reject(new RunAborted());
+      signal.addEventListener("abort", onAbort, { once: true });
+      promise.then(
+        (val) => {
+          signal.removeEventListener("abort", onAbort);
+          resolve(val);
+        },
+        (err) => {
+          signal.removeEventListener("abort", onAbort);
+          reject(err);
+        }
+      );
+    });
+    if (signal.aborted) throw new RunAborted();
+    return result;
+  } catch (err) {
+    if (signal.aborted) throw new RunAborted();
+    throw err;
+  }
+}
+
+/** 惰性观察事件发射器：仅在存在 `onEvent` 订阅者时才调用工厂函数构造事件，避免无订阅者时产生深拷贝或摘要开销。 */
 type EmitEvent = (build: () => AgentEvent) => void;
 
 /** Anthropic Beta Messages 流式请求入参类型别名。 */
 type BetaStreamParams = Parameters<Anthropic["beta"]["messages"]["stream"]>[0];
 
-/**
- * 单轮工具调用批次串行执行所需的共享运行上下文。
- */
+/** 单轮工具调用批次串行执行所需的共享运行上下文。 */
 interface ToolBatchExecutionContext {
   /** 工具名称到 `AgentTool` 实例的只读查找映射。 */
   toolMap: ReadonlyMap<string, AgentTool>;
@@ -768,36 +673,17 @@ interface ToolBatchExecutionContext {
   emit: EmitEvent;
 }
 
-/**
- * 为一批未进入实际执行的 `tool_use` 块批量构造指定原因的错误态 `tool_result` 块，
- * 以确保会话历史始终满足 Anthropic API 的 `tool_use` / `tool_result` 配对要求。
- *
- * @param blocks 被跳过的模型 `tool_use` 内容块列表。
- * @param reason 向模型说明该调用未执行的具体原因文案。
- * @returns 标记为 `is_error: true` 的 `tool_result` 内容块数组。
- */
+/** 为一批未进入实际执行的 `tool_use` 块批量构造指定原因的错误态 `tool_result` 块，维持 API 历史配对要求。 */
 function buildSkippedToolResults(
   blocks: readonly Anthropic.Beta.Messages.BetaToolUseBlock[],
   reason: string
 ): Anthropic.Beta.Messages.BetaToolResultBlockParam[] {
-  return blocks.map((b) => ({
-    type: "tool_result" as const,
-    tool_use_id: b.id,
-    is_error: true,
-    content: reason,
-  }));
+  return blocks.map((b) => makeErrorToolResult(b.id, reason));
 }
 
 /**
  * 发起单轮模型流式请求，并在存在订阅者时桥接流式增量观察事件（思考、正文、工具调用起点与参数 JSON 增量），
  * 等待并返回聚合完成的最终模型响应消息。
- *
- * @param client Anthropic SDK 客户端实例。
- * @param params 流式请求参数（含模型、系统提示词、工具定义与归一化消息）。
- * @param signal 可选的取消信号。
- * @param subscribeEvents 是否监听底层流事件并转换为 `AgentEvent`。
- * @param emit 惰性观察事件发射器。
- * @returns 完整接收后的 `BetaMessage` 响应对象。
  */
 function streamModelTurn(
   client: Anthropic,
@@ -843,10 +729,6 @@ function streamModelTurn(
  * 在本地执行单个 `tool_use` 块：
  * 依次完成取消预检、工具查找、参数深拷贝隔离、`parse` 校验、`run` 执行与异常兜底，
  * 并严格保证一旦发出 `tool_start` 观察事件，必有配对的 `tool_end` 事件发出。
- *
- * @param block 模型输出的单个 `tool_use` 调用块。
- * @param ctx 工具批次共享执行上下文。
- * @returns 可写入 `user` 消息回传给模型的 `tool_result` 内容块。
  */
 async function executeSingleToolBlock(
   block: Anthropic.Beta.Messages.BetaToolUseBlock,
@@ -855,22 +737,12 @@ async function executeSingleToolBlock(
   const { toolMap, toolNamesList, signal, hasEventSubscriber, emit } = ctx;
 
   if (signal?.aborted) {
-    return {
-      type: "tool_result",
-      tool_use_id: block.id,
-      content: "因运行已取消，该工具调用已跳过（未启动）。",
-      is_error: true,
-    };
+    return makeErrorToolResult(block.id, "因运行已取消，该工具调用已跳过（未启动）。");
   }
 
   const tool = toolMap.get(block.name);
   if (!tool) {
-    return {
-      type: "tool_result",
-      tool_use_id: block.id,
-      content: `错误：未知工具 '${block.name}'。可用工具：${toolNamesList || "（无）"}`,
-      is_error: true,
-    };
+    return makeErrorToolResult(block.id, `错误：未知工具 '${block.name}'。可用工具：${toolNamesList || "（无）"}`);
   }
 
   // 观察者拿独立的输入快照（与下方执行用副本相互隔离），防止日志器就地修改参数影响实际工具执行
@@ -885,12 +757,7 @@ async function executeSingleToolBlock(
   let details: unknown;
   if (signal?.aborted) {
     // onEvent(tool_start) 同步回调期间可能触发取消：工具尚未执行，跳过运行但仍发出下方配对的 tool_end
-    resultBlock = {
-      type: "tool_result",
-      tool_use_id: block.id,
-      content: "因运行在启动前取消，该工具调用已跳过（未执行）。",
-      is_error: true,
-    };
+    resultBlock = makeErrorToolResult(block.id, "因运行在启动前取消，该工具调用已跳过（未执行）。");
   } else {
     // 进度只在工具运行期间有效；工具返回（或抛错）后的调用被忽略
     let running = true;
@@ -930,32 +797,25 @@ async function executeSingleToolBlock(
         : err instanceof Error
           ? err.message
           : String(err);
-      resultBlock = { type: "tool_result", tool_use_id: block.id, content: errMsg, is_error: true };
+      resultBlock = makeErrorToolResult(block.id, errMsg);
     } finally {
       running = false;
     }
   }
 
-  const finished = resultBlock;
   emit(() => ({
     type: "tool_end",
     id: block.id,
     name: block.name,
-    isError: finished.is_error === true,
-    outputSummary: summarizeToolOutput(finished.content),
+    isError: resultBlock.is_error === true,
+    outputSummary: summarizeToolOutput(resultBlock.content),
     ...(details !== undefined ? { details } : {}),
   }));
 
-  return finished;
+  return resultBlock;
 }
 
-/**
- * 按模型响应中的出现顺序严格串行执行整批 `tool_use` 工具调用块，并返回对应的结果块列表。
- *
- * @param blocks 当前 `assistant` 响应中待执行的全部 `tool_use` 块。
- * @param ctx 工具批次共享执行上下文。
- * @returns 与 `blocks` 一一对应的 `tool_result` 内容块数组。
- */
+/** 按模型响应中的出现顺序严格串行执行整批 `tool_use` 工具调用块。 */
 async function executeToolBatch(
   blocks: readonly Anthropic.Beta.Messages.BetaToolUseBlock[],
   ctx: ToolBatchExecutionContext
@@ -1038,7 +898,7 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
     } catch {}
   };
 
-  /** 将一条新增的完整消息写入本次运行历史，并完整等待宿主的 `onMessage` 持久化回调。 */
+  /** 将一条新增的完整消息写入本次运行历史，并完整等待宿主的 `onMessage` 持久化回调（持久化报错即使发生在取消后也原样上抛）。 */
   const appendMessage = async (msg: Anthropic.Beta.Messages.BetaMessageParam) => {
     messages.push(msg);
     if (onMessage) {
@@ -1046,11 +906,14 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
     }
   };
 
+  /** 若取消信号已触发，立即抛出内部 `RunAborted` 信令跳转至统一取消出口。 */
+  const throwIfAborted = () => {
+    if (signal?.aborted) throw new RunAborted();
+  };
+
   try {
     // 入口预取消检查：若调用前 signal 已取消，直接返回 aborted，不写入恢复消息
-    if (signal?.aborted) {
-      return { messages, lastText, stopReason: "aborted", turns, usage };
-    }
+    throwIfAborted();
 
     const trailingRecovery = buildTrailingRecoveryMessage(messages);
     if (trailingRecovery) {
@@ -1058,31 +921,15 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
     }
 
     for (let turn = 0; turn < maxTurns; turn++) {
-      if (signal?.aborted) {
-        stopReason = "aborted";
-        break;
-      }
+      throwIfAborted();
 
       // 准备本次请求的消息：默认即完整历史；prepareMessages 的结果只用于本次请求
       let requestMessages: Anthropic.Beta.Messages.BetaMessageParam[] = messages;
       if (prepareMessages) {
-        let prepared: unknown;
-        try {
-          const pending = Promise.resolve().then(() =>
-            prepareMessages({ messages: [...messages], turn: turns + 1, signal })
-          );
-          prepared = await raceWithSignal(pending, signal);
-        } catch (err) {
-          if (signal?.aborted) {
-            stopReason = "aborted";
-            break;
-          }
-          throw err;
-        }
-        if (signal?.aborted) {
-          stopReason = "aborted";
-          break;
-        }
+        const prepared = await runAbortable(
+          () => prepareMessages({ messages: [...messages], turn: turns + 1, signal }),
+          signal
+        );
         validatePreparedMessages(prepared, messages);
         requestMessages = prepared;
       }
@@ -1094,37 +941,32 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
       const apiMessages = buildApiRequestMessages(requestMessages, addDefaultCacheBreakpoints);
       turns++;
 
-      let response: Anthropic.Beta.Messages.BetaMessage;
-      try {
-        response = await streamModelTurn(
-          client,
-          {
-            model,
-            max_tokens: maxTokens,
-            system: addDefaultCacheBreakpoints
-              ? [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }]
-              : systemPrompt,
-            ...(apiTools.length > 0 ? { tools: apiTools } : {}),
-            messages: apiMessages,
-            ...(thinking ? { thinking } : {}),
-          },
-          signal,
-          Boolean(onEvent),
-          emit
-        );
-      } catch (err) {
-        if (signal?.aborted) {
-          stopReason = "aborted";
-          break;
-        }
+      const response = await streamModelTurn(
+        client,
+        {
+          model,
+          max_tokens: maxTokens,
+          system: addDefaultCacheBreakpoints
+            ? [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }]
+            : systemPrompt,
+          ...(apiTools.length > 0 ? { tools: apiTools } : {}),
+          messages: apiMessages,
+          ...(thinking ? { thinking } : {}),
+        },
+        signal,
+        Boolean(onEvent),
+        emit
+      ).catch((err) => {
+        throwIfAborted();
         throw err;
-      }
+      });
 
       usage.inputTokens += response.usage.input_tokens;
       usage.outputTokens += response.usage.output_tokens;
       usage.cacheReadTokens += response.usage.cache_read_input_tokens ?? 0;
       usage.cacheCreationTokens += response.usage.cache_creation_input_tokens ?? 0;
 
+      // 注意：此处不检查取消——若最终回复（无 tool_use）已完整到达，即使与取消同时发生也以完成为准
       await appendMessage({ role: "assistant", content: response.content });
 
       lastText = response.content
@@ -1170,27 +1012,14 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
               emit,
             });
 
-      // 1. 先记录并持久化本轮工具结果（或 max_tokens 截断未执行结果）
+      // 1. 先记录并持久化本轮工具结果（或 max_tokens 截断未执行结果），确保历史配对后再响应取消
       await appendMessage({ role: "user", content: userContent });
-
-      if (signal?.aborted) {
-        stopReason = "aborted";
-        break;
-      }
+      throwIfAborted();
 
       // 2. 获取增量上下文（若钩子抛错且非取消，向上抛出以避免遗漏关键控制指令）
       if (getContextInjection) {
-        let injected: string | null = null;
-        try {
-          injected = await raceWithSignal(getContextInjection({ signal }), signal);
-        } catch (err) {
-          if (signal?.aborted) {
-            stopReason = "aborted";
-            break;
-          }
-          throw err;
-        }
-        if (injected && !signal?.aborted) {
+        const injected = await runAbortable(() => getContextInjection({ signal }), signal);
+        if (injected) {
           await appendMessage({
             role: "user",
             content: [{ type: "text", text: injected }],
@@ -1198,11 +1027,8 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
         }
       }
 
-      // 若在增量上下文返回或保存注入消息期间触发了取消，优先报告 aborted 而非 max_turns
-      if (signal?.aborted) {
-        stopReason = "aborted";
-        break;
-      }
+      // 若在保存注入消息期间触发了取消，优先报告 aborted 而非 max_turns
+      throwIfAborted();
 
       if (turn === maxTurns - 1) {
         stopReason = "max_turns";
@@ -1211,6 +1037,9 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
 
     return { messages, lastText, stopReason, turns, usage };
   } catch (err: unknown) {
+    if (err instanceof RunAborted) {
+      return { messages, lastText, stopReason: "aborted", turns, usage };
+    }
     const message = err instanceof Error ? err.message : String(err);
     throw new AgentRunError(message, { messages, turns, usage }, { cause: err });
   }
@@ -1244,43 +1073,22 @@ const BASH_PROGRESS_INTERVAL_MS = 250;
 /** 单次节流周期内累积的进度增量文本最大字符上限（超出时只保留末尾并注明省略字符数）。 */
 const BASH_PROGRESS_MAX_CHARS = 8_192;
 
-/**
- * 安全提取 Node.js 系统异常对象上的错误码（如 `"ENOENT"`、`"EPERM"`）。
- *
- * @param err 捕获到的未知异常值。
- * @returns 系统错误码字符串；若不存在则返回 `undefined`。
- */
+/** 安全提取 Node.js 系统异常对象上的错误码（如 `"ENOENT"`、`"EPERM"`）。 */
 function errnoCode(err: unknown): string | undefined {
   return (err as NodeJS.ErrnoException | null)?.code;
 }
 
-/**
- * 将整 KiB 或整 MiB 的字节限额常量格式化为人类可读的单位文案（如 `"16 KiB"`、`"64 MiB"`）。
- *
- * @param bytes 字节数（仅用于整 KiB / MiB 的限额常量）。
- * @returns 带 `KiB` 或 `MiB` 单位的字符串。
- */
+/** 将整 KiB 或整 MiB 的字节限额常量格式化为人类可读的单位文案（如 `"16 KiB"`、`"64 MiB"`）。 */
 function formatBytes(bytes: number): string {
   return bytes >= 1024 * 1024 ? `${bytes / (1024 * 1024)} MiB` : `${bytes / 1024} KiB`;
 }
 
-/**
- * 判断单个字节是否为 UTF-8 多字节序列的后续字节（即二进制高两位为 `10`，范围 `0x80`–`0xBF`）。
- *
- * @param byte 待检查的无符号字节值（0–255）。
- * @returns 为 UTF-8 后续字节时返回 `true`。
- */
+/** 判断单个字节是否为 UTF-8 多字节序列的后续字节（高两位为 `10`，即 `0x80`–`0xBF`）。 */
 function isUtf8ContinuationByte(byte: number): boolean {
   return (byte & 0xc0) === 0x80;
 }
 
-/**
- * 在不超过 `maxLen` 的前提下，向下回退对齐到合法的 UTF-8 字符边界（避免在前缀截断处切开多字节字符）。
- *
- * @param buf UTF-8 编码的字节缓冲区。
- * @param maxLen 允许保留的最大前缀字节长度。
- * @returns 对齐后的安全前缀结束字节下标。
- */
+/** 在不超过 `maxLen` 的前提下，向下回退对齐到合法的 UTF-8 字符边界（避免在前缀截断处切开多字节字符）。 */
 function alignUtf8PrefixEnd(buf: Buffer, maxLen: number): number {
   let end = Math.min(buf.length, maxLen);
   while (end > 0 && isUtf8ContinuationByte(buf[end])) {
@@ -1289,13 +1097,7 @@ function alignUtf8PrefixEnd(buf: Buffer, maxLen: number): number {
   return end;
 }
 
-/**
- * 从 `startIdx` 起向上推进对齐到合法的 UTF-8 字符起始边界（避免在后缀截断起点处残留半个多字节字符）。
- *
- * @param buf UTF-8 编码的字节缓冲区。
- * @param startIdx 期望的后缀起始字节下标。
- * @returns 对齐后的安全后缀起始字节下标。
- */
+/** 从 `startIdx` 起向上推进对齐到合法的 UTF-8 字符起始边界（避免在后缀截断起点处残留半个多字节字符）。 */
 function alignUtf8SuffixStart(buf: Buffer, startIdx: number): number {
   let start = Math.max(0, startIdx);
   while (start < buf.length && isUtf8ContinuationByte(buf[start])) {
@@ -1357,9 +1159,9 @@ function createThrottledTextReporter(report: (progress: AgentToolProgress) => vo
  */
 export class HeadTailBuffer {
   /** 已保存的输出开头前缀字节块。 */
-  private head = Buffer.alloc(0);
+  private head: Buffer = Buffer.alloc(0);
   /** 已保存的输出末尾滚动后缀字节块。 */
-  private tail = Buffer.alloc(0);
+  private tail: Buffer = Buffer.alloc(0);
   /** `head` 是否已封口（一旦溢出部分进入 `tail` 即置为 `true`，不再向 `head` 追加）。 */
   private headSealed = false;
   /** 累计接收到的流原始字节总数（含可能被解码替换的非法字节）。 */
@@ -1387,7 +1189,7 @@ export class HeadTailBuffer {
   append(text: string, rawByteLength: number): void {
     this.totalBytes += rawByteLength;
     if (!text) return;
-    const chunk = Buffer.from(text, "utf-8");
+    let chunk = Buffer.from(text, "utf-8");
     this.decodedBytes += chunk.length;
 
     if (!this.headSealed && this.head.length < this.headLimit) {
@@ -1395,12 +1197,9 @@ export class HeadTailBuffer {
       if (needed > 0) {
         this.head = Buffer.concat([this.head, chunk.subarray(0, needed)]);
       }
-      const rest = chunk.subarray(needed);
-      if (rest.length > 0) {
-        this.headSealed = true;
-        this.appendTail(rest);
-      }
-    } else {
+      chunk = chunk.subarray(needed);
+    }
+    if (chunk.length > 0) {
       this.headSealed = true;
       this.appendTail(chunk);
     }
@@ -1412,18 +1211,13 @@ export class HeadTailBuffer {
    * @param chunk 待写入尾部缓冲区的 UTF-8 字节块。
    */
   private appendTail(chunk: Buffer): void {
-    if (chunk.length >= this.tailLimit) {
-      const start = alignUtf8SuffixStart(chunk, chunk.length - this.tailLimit);
-      this.tail = Buffer.from(chunk.subarray(start));
-    } else {
-      const combined = Buffer.concat([this.tail, chunk]);
-      if (combined.length > this.tailLimit) {
-        const start = alignUtf8SuffixStart(combined, combined.length - this.tailLimit);
-        this.tail = Buffer.from(combined.subarray(start));
-      } else {
-        this.tail = combined;
-      }
+    const src = chunk.length >= this.tailLimit ? chunk : Buffer.concat([this.tail, chunk]);
+    if (src.length < this.tailLimit) {
+      this.tail = src;
+      return;
     }
+    const start = alignUtf8SuffixStart(src, src.length - this.tailLimit);
+    this.tail = Buffer.from(src.subarray(start));
   }
 
   /** 是否有中间内容被省略（即已解码总字节数大于 `head` 与 `tail` 实际保留字节数之和）。 */
@@ -1483,22 +1277,13 @@ class BashOutputLog {
   /** 日志文件是否已由当前实例以 `"wx"` 模式成功创建（防止撞名时误删他人文件）。 */
   private created = false;
 
-  /**
-   * 构造按需落盘的 Bash 输出日志器。
-   *
-   * @param resolveDir 日志目录惰性解析函数；为 `undefined` 时禁用日志保存。
-   * @param openThreshold 触发创建磁盘日志文件的输出字节数阈值。
-   */
+  /** 构造按需落盘的 Bash 输出日志器（`resolveDir` 为 `undefined` 时禁用日志保存）。 */
   constructor(
     private readonly resolveDir: (() => string) | undefined,
     private readonly openThreshold: number
   ) {}
 
-  /**
-   * 追加一段已解码输出文本：未达阈值时缓存在内存，超过阈值时打开日志文件并流式写入。
-   *
-   * @param text 已解码的 UTF-8 文本片段。
-   */
+  /** 追加一段已解码输出文本：未达阈值时缓存在内存，超过阈值时打开日志文件并流式写入。 */
   append(text: string): void {
     if (!text || !this.resolveDir || this.failed) return;
     if (!this.stream) {
@@ -1512,11 +1297,7 @@ class BashOutputLog {
     this.write(text);
   }
 
-  /**
-   * 确保日志目录存在并以独占模式（`wx`，权限 `0600`）创建新的日志文件写入流。
-   *
-   * @returns 成功创建流时返回 `true`，失败时标记 `failed` 并返回 `false`。
-   */
+  /** 确保日志目录存在并以独占模式（`wx`，权限 `0600`）创建新的日志文件写入流。 */
   private open(): boolean {
     try {
       const dir = this.resolveDir!();
@@ -1537,11 +1318,7 @@ class BashOutputLog {
     }
   }
 
-  /**
-   * 在不超过 `MAX_BASH_LOG_BYTES` 预算的前提下，按 UTF-8 字符边界向日志流写入文本。
-   *
-   * @param text 待写入的 UTF-8 字符串。
-   */
+  /** 在不超过 `MAX_BASH_LOG_BYTES` 预算的前提下，按 UTF-8 字符边界向日志流写入文本。 */
   private write(text: string): void {
     if (this.capped || !this.stream) return;
     let buf = Buffer.from(text, "utf-8");
@@ -1560,9 +1337,6 @@ class BashOutputLog {
    * 结束写入并等待文件真正关闭（`"close"` 事件），再按流自身的错误状态判断日志是否可用：
    * `destroyed` 只表示开始销毁，`error` 事件可能尚未派发；`end()` 回调也不代表文件描述符已关闭。
    * `keep` 为 `false` 或写入失败时删除文件——但只删除本次成功创建的文件（`"wx"` 撞名失败时路径属于他人）。不会抛错。
-   *
-   * @param keep 是否需要保留该日志文件（仅命令未启动报错、未取消且输出确实发生截断时保留）。
-   * @returns 日志可用时返回 `{ path, complete }`，否则返回 `undefined`。
    */
   async close(keep: boolean): Promise<{ path: string; complete: boolean } | undefined> {
     this.pending = [];
@@ -1587,12 +1361,7 @@ const activeProcessGroups = new Set<number>();
 /** 是否已在 `process` 上惰性注册过 `"exit"` 同步强杀兜底监听器。 */
 let exitHookRegistered = false;
 
-/**
- * 登记一个新启动的受控进程组 PID，并在首次实际启动进程组时惰性注册宿主 `process.once("exit")` 同步 `SIGKILL` 兜底钩子，
- * 避免仅使用 Agent 核心循环时在模块加载期产生全局事件监听副作用。
- *
- * @param pid 以 `detached: true` 启动的子进程领头 PID（即进程组 ID）。
- */
+/** 登记新启动的受控进程组 PID，并在首次启动时惰性注册宿主 `process.once("exit")` 同步 `SIGKILL` 兜底钩子。 */
 function trackActiveProcessGroup(pid: number): void {
   if (!exitHookRegistered) {
     exitHookRegistered = true;
@@ -1605,13 +1374,7 @@ function trackActiveProcessGroup(pid: number): void {
   activeProcessGroups.add(pid);
 }
 
-/**
- * 探测指定进程组（`-pid`）内是否仍有存活进程。
- * 发送信号 `0` 不实际杀死进程；若抛错且错误码为 `EPERM` 表示进程存在但无权发信号，仍判定为存活。
- *
- * @param pid 进程组领头 PID。
- * @returns 进程组内仍有进程存活时返回 `true`，已全部退出时返回 `false`。
- */
+/** 探测指定进程组（`-pid`）内是否仍有存活进程（信号 `0` 报 `EPERM` 时表示进程存在但无权发信号，仍视为存活）。 */
 function isProcessGroupAlive(pid: number): boolean {
   try {
     process.kill(-pid, 0);
@@ -1621,12 +1384,7 @@ function isProcessGroupAlive(pid: number): boolean {
   }
 }
 
-/**
- * 向整个进程组（`-pid`）发送信号，忽略进程组已退出（`ESRCH`）等异常。
- *
- * @param pid 进程组领头 PID（为空时直接跳过）。
- * @param sig 要发送的 POSIX 信号（如 `"SIGTERM"` 或 `"SIGKILL"`）。
- */
+/** 向整个进程组（`-pid`）发送信号，忽略进程组已退出（`ESRCH`）等异常。 */
 function sendProcessGroupSignal(pid: number | undefined, sig: NodeJS.Signals): void {
   if (!pid) return;
   try {
@@ -1738,9 +1496,8 @@ export function runBashProcessGroup(
       collect(stderrDecoder.write(chunk), chunk.length);
     });
 
-    let timedOut = false;
-    let aborted = false;
-    let terminating = false;
+    // 终止模式单一状态机："none"（正常运行/排空）| "timeout"（超时终止中）| "abort"（外部取消终止中）
+    let stopMode: "none" | "timeout" | "abort" = "none";
     let shellExited = false;
     let exitCode: number | null = null;
     let exitSignal: NodeJS.Signals | null = null;
@@ -1763,7 +1520,6 @@ export function runBashProcessGroup(
       clearTimeout(postKillTimer);
       clearInterval(groupPollTimer);
       clearTimeout(drainTimer);
-      drainTimer = undefined;
       signal?.removeEventListener("abort", onAbort);
 
       // 冲刷两个解码器中可能残留的末尾字节
@@ -1777,12 +1533,12 @@ export function runBashProcessGroup(
       sendProcessGroupSignal(pid, "SIGKILL");
 
       // 结果此刻已确定；等待日志落盘只是为了在返回前关闭文件（close 不会抛错）
-      const keepLog = !spawnErr && !aborted && buffer.isTruncated;
+      const keepLog = !spawnErr && stopMode !== "abort" && buffer.isTruncated;
       void log.close(keepLog).then((savedLog) => {
         const output = buffer.format(savedLog);
         if (spawnErr) return reject(spawnErr);
-        if (aborted) return reject(signal?.reason); // 原样传递取消原因（可能是 null 等任意值）
-        if (timedOut) {
+        if (stopMode === "abort") return reject(signal?.reason); // 原样传递取消原因（可能是 null 等任意值）
+        if (stopMode === "timeout") {
           return reject(new Error(`命令执行超时（超过 ${timeoutMs}ms 已终止）${output ? `：\n${output}` : "。"}`));
         }
         resolve({ exitCode, exitSignal, output, ...(savedLog ? { log: savedLog } : {}) });
@@ -1804,10 +1560,12 @@ export function runBashProcessGroup(
       }
     };
 
-    /** 启动进程组终止序列：先发送 `SIGTERM` 并高频轮询，宽限期 `KILL_GRACE_MS` 届满仍未退尽则发送 `SIGKILL`。 */
-    const startTerminationSequence = () => {
-      if (terminating || settled) return;
-      terminating = true;
+    /** 启动进程组终止序列：先发 `SIGTERM` 并高频轮询，宽限期届满仍未退尽则发 `SIGKILL`（若已在超时终止中又收到取消，升级状态但不重置计时器）。 */
+    const startTerminationSequence = (mode: "timeout" | "abort") => {
+      if (settled) return;
+      const alreadyTerminating = stopMode !== "none";
+      stopMode = mode;
+      if (alreadyTerminating) return;
       clearTimeout(timeoutTimer);
       clearTimeout(drainTimer);
       drainTimer = undefined;
@@ -1825,17 +1583,13 @@ export function runBashProcessGroup(
       }, KILL_GRACE_MS);
     };
 
-    timeoutTimer = setTimeout(() => {
-      timedOut = true;
-      startTerminationSequence();
-    }, timeoutMs);
+    timeoutTimer = setTimeout(() => startTerminationSequence("timeout"), timeoutMs);
 
     /** 响应外部 `AbortSignal` 取消：若命令尚未自然退出则标记为已取消并启动进程组终止序列。 */
     const onAbort = () => {
       // shell 已退出时结果已确定：取消只提前结束输出排空，不把已完成的命令改报为取消
-      if (shellExited && !terminating) return finalize();
-      aborted = true;
-      startTerminationSequence();
+      if (shellExited && stopMode === "none") return finalize();
+      startTerminationSequence("abort");
     };
     signal?.addEventListener("abort", onAbort, { once: true });
 
@@ -1845,7 +1599,7 @@ export function runBashProcessGroup(
       shellExited = true;
       exitCode = code;
       exitSignal = sig;
-      if (terminating) return checkGroupDead();
+      if (stopMode !== "none") return checkGroupDead();
       // timeoutMs 只约束 shell 本身；退出后的输出排空另有 IO_DRAIN_GRACE_MS 上限，不再触发超时
       clearTimeout(timeoutTimer);
       scheduleDrainAndFinalize();
@@ -1855,13 +1609,9 @@ export function runBashProcessGroup(
       shellExited = true;
       if (exitCode === null) exitCode = code;
       if (exitSignal === null) exitSignal = sig;
-      if (terminating) {
-        if (!pid || !isProcessGroupAlive(pid)) {
-          finalize();
-        }
-        return;
+      if (stopMode === "none" || !pid || !isProcessGroupAlive(pid)) {
+        finalize();
       }
-      finalize();
     });
   });
 }
@@ -1928,14 +1678,7 @@ async function resolveExistingRealPath(targetPath: string): Promise<string> {
   }
 }
 
-/**
- * 将文件字节缓冲区严格解码为 UTF-8 文本：
- * 先检查开头 1024 字节是否含 NUL（`0x00`）以快速拦截二进制文件，再通过 `utf8FatalDecoder` 校验完整 UTF-8 编码合法性。
- *
- * @param buf 文件原始字节缓冲区。
- * @param filePath 用于拼装错误提示的文件路径。
- * @returns 解码后的 UTF-8 字符串（若原文件带 BOM 则保留开头的 `U+FEFF`）。
- */
+/** 将文件字节严格解码为 UTF-8 文本：先检查前 1024 字节是否含 NUL 快速拦截二进制文件，再通过 `utf8FatalDecoder` 校验编码合法性（保留 BOM）。 */
 function decodeStrictUtf8(buf: Buffer, filePath: string): string {
   if (buf.subarray(0, 1024).includes(0)) {
     throw new Error(`检测到二进制文件：${filePath}，无法作为 UTF-8 文本处理。`);
@@ -1947,28 +1690,22 @@ function decodeStrictUtf8(buf: Buffer, filePath: string): string {
   }
 }
 
-/**
- * 按文件头魔数（Magic Bytes）识别 `read` 支持的图片格式（PNG、JPEG、GIF87a/GIF89a、WebP；需至少 12 字节才能识别 WebP）。
- *
- * @param head 文件开头的字节片段（建议至少 12 字节）。
- * @returns 属于受支持图片格式时返回 `true`。
- */
+/** PNG 文件头 8 字节魔数签名。 */
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+/** 按文件头魔数识别 `read` 支持的图片格式（PNG、JPEG、GIF87a/GIF89a、WebP；需至少 12 字节才能识别 WebP）。 */
 function isSupportedImage(head: Buffer): boolean {
+  const gif = head.toString("ascii", 0, 6);
   return (
-    head.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) ||
+    head.subarray(0, 8).equals(PNG_SIGNATURE) ||
     (head.length >= 3 && head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) ||
-    ["GIF87a", "GIF89a"].includes(head.toString("ascii", 0, 6)) ||
+    gif === "GIF87a" ||
+    gif === "GIF89a" ||
     (head.toString("ascii", 0, 4) === "RIFF" && head.toString("ascii", 8, 12) === "WEBP")
   );
 }
 
-/**
- * 只读打开文件并读取开头最多 `length` 个字节，用于在整文件读入内存前低开销探测文件类型。
- *
- * @param filePath 目标文件绝对路径。
- * @param length 要读取的最大头部字节数。
- * @returns 实际读取到的文件头字节切片。
- */
+/** 只读打开文件并读取开头最多 `length` 个字节，用于在整文件读入内存前低开销探测类型。 */
 async function readFileHead(filePath: string, length: number): Promise<Buffer> {
   const handle = await fs.open(filePath, "r");
   try {
@@ -1979,12 +1716,7 @@ async function readFileHead(filePath: string, length: number): Promise<Buffer> {
   }
 }
 
-/**
- * 按需动态加载 `sharp` 原生图片处理模块：
- * 只使用文本工具的宿主不会因运行环境缺少 `sharp` 平台二进制而在加载本文件时报错。
- *
- * @returns `sharp` 默认导出函数。
- */
+/** 按需动态加载 `sharp` 原生模块，使仅使用文本工具的宿主不会在模块加载期依赖 `sharp` 二进制。 */
 async function loadSharp(): Promise<typeof import("sharp").default> {
   try {
     return (await import("sharp")).default;
@@ -1993,23 +1725,14 @@ async function loadSharp(): Promise<typeof import("sharp").default> {
   }
 }
 
-/**
- * 根据原始字节长度精确计算标准 Base64 编码（含 `=` 填充位）后的字符长度。
- *
- * @param byteLength 二进制数据的字节长度。
- * @returns 对应的 Base64 字符串长度。
- */
+/** 根据原始字节长度精确计算标准 Base64 编码（含 `=` 填充位）后的字符长度。 */
 function base64Length(byteLength: number): number {
   return 4 * Math.ceil(byteLength / 3);
 }
 
 /**
  * 判断 PNG 缓冲区是否确定为静态图：按 chunk 边界扫描到首个 `IDAT` 为止，
- * 若出现 `acTL`（APNG 动画控制块，规范要求位于 `IDAT` 之前）或 chunk 结构无法可靠解析则返回 `false`。
- * 仅用于决定能否原样直通返回原始字节，误判为“非静态”只会安全退回重编码分支。
- *
- * @param buf 完整的 PNG 文件字节缓冲区。
- * @returns 确认为普通静态 PNG 时返回 `true`。
+ * 若出现 `acTL`（APNG 动画控制块，规范要求位于 `IDAT` 之前）或结构无法解析则返回 `false`（安全退回重编码分支）。
  */
 function isStaticPng(buf: Buffer): boolean {
   let offset = 8;
@@ -2089,7 +1812,6 @@ async function readImage(buf: Buffer, filePath: string, signal?: AbortSignal): P
   signal?.throwIfAborted();
 
   let compressed = false;
-  let flattened = false;
   if (base64Length(result.data.length) > MAX_IMAGE_BASE64_CHARS) {
     result = await base
       .clone()
@@ -2098,8 +1820,6 @@ async function readImage(buf: Buffer, filePath: string, signal?: AbortSignal): P
       .toBuffer({ resolveWithObject: true });
     signal?.throwIfAborted();
     compressed = true;
-    // channels === 4 也可能是 CMYK，透明度以 hasAlpha 为准
-    flattened = metadata.hasAlpha === true;
   }
   if (base64Length(result.data.length) > MAX_IMAGE_BASE64_CHARS) {
     throw new Error(
@@ -2115,8 +1835,11 @@ async function readImage(buf: Buffer, filePath: string, signal?: AbortSignal): P
       `实际发送尺寸 ${result.info.width}x${result.info.height}（${mediaType}）。`,
   ];
   if ((metadata.pages ?? 1) > 1) notes.push("仅取第一帧。");
-  if (compressed) notes.push("为控制在传输体积上限内，已转为 JPEG 压缩。");
-  if (flattened) notes.push("透明区域已铺白底合成。");
+  if (compressed) {
+    notes.push("为控制在传输体积上限内，已转为 JPEG 压缩。");
+    // channels === 4 也可能是 CMYK，透明度以 hasAlpha 为准
+    if (metadata.hasAlpha === true) notes.push("透明区域已铺白底合成。");
+  }
   return [
     { type: "text", text: notes.join("") },
     { type: "image", source: { type: "base64", media_type: mediaType, data } },
@@ -2178,12 +1901,7 @@ async function atomicWriteFile(targetPath: string, content: string, signal?: Abo
   }
 }
 
-/**
- * 剥离字符串开头可能存在的单个 UTF-8 BOM（`U+FEFF`）字符。
- *
- * @param text 原始解码文本。
- * @returns 不含前导 BOM 的文本。
- */
+/** 剥离字符串开头可能存在的单个 UTF-8 BOM（`U+FEFF`）字符。 */
 function stripLeadingBom(text: string): string {
   return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
 }
@@ -2253,13 +1971,7 @@ function formatReadText(decodedText: string, offset?: number, limit?: number): s
   return numbered;
 }
 
-/**
- * 在原文本中查找所有不把 `"\r\n"` 从中间劈开的有效精确匹配位置（最多收集 2 处即可判断唯一性）。
- *
- * @param content 待检索的原文件全文。
- * @param needle 待定位的目标子串（非空）。
- * @returns 有效匹配的起始字符下标数组（长度 0、1 或 2）。
- */
+/** 在原文本中查找不把 `"\r\n"` 从中间劈开的有效精确匹配位置（最多收集 2 处即可判断唯一性）。 */
 function findMatchesWithoutSplittingCrLf(content: string, needle: string): number[] {
   const matches: number[] = [];
   let searchFrom = 0;
@@ -2303,8 +2015,7 @@ function applyTextEdits(
   filePath: string
 ): { updated: string; firstChangedLine: number } {
   const hasCrLf = rawContent.includes("\r\n");
-  const hasBareLf = rawContent.replace(/\r\n/g, "").includes("\n");
-  const isPureCrLfFile = hasCrLf && !hasBareLf;
+  const isPureCrLfFile = hasCrLf && !/(?<!\r)\n/.test(rawContent);
   const label = (i: number) => (edits.length === 1 ? "old_text" : `edits[${i}].old_text`);
 
   const located = edits.map(({ old_text, new_text }, i) => {
@@ -2374,41 +2085,21 @@ function applyTextEdits(
   return { updated, firstChangedLine };
 }
 
-/**
- * 将 `BashRunResult` 转换为符合 `AgentToolResult` 契约的工具返回结构：
- * 非零退出（含信号终止）时返回 `isError: true` 并附带退出状态说明，同时将退出码、信号与日志信息放入 `details` 交给宿主。
- *
- * @param result 底层进程组执行完成后的原始结果。
- * @returns 包含模型可读文本 `content` 与宿主侧元数据 `details` 的 `AgentToolResult`。
- */
+/** 将 `BashRunResult` 转换为 `AgentToolResult`：非零退出时标记 `isError: true`，并将退出码、信号与日志元数据放入 `details`。 */
 function formatBashToolResult(result: BashRunResult): AgentToolResult {
   const { exitCode, exitSignal, output, log } = result;
   const details = { exitCode, exitSignal, ...(log ? { log } : {}) };
   if (exitCode !== 0) {
-    const statusDesc =
-      exitCode !== null
-        ? `退出码 ${exitCode}`
-        : exitSignal
-          ? `信号 ${exitSignal}`
-          : "未知信号";
+    const signalDesc = exitSignal ? `信号 ${exitSignal}` : "未知信号";
+    const statusDesc = exitCode !== null ? `退出码 ${exitCode}` : signalDesc;
     const emptyNote =
-      exitCode !== null
-        ? `（命令以退出码 ${exitCode} 退出，无输出）`
-        : exitSignal
-          ? `（命令因信号 ${exitSignal} 终止，无输出）`
-          : "（命令因未知信号终止，无输出）";
+      exitCode !== null ? `（命令以退出码 ${exitCode} 退出，无输出）` : `（命令因${signalDesc}终止，无输出）`;
     return { content: `命令执行失败（${statusDesc}）：\n${output || emptyNote}`, isError: true, details };
   }
   return { content: output || "（命令正常退出，退出码 0，无输出）", details };
 }
 
-/**
- * 判断规范化后的绝对路径 `targetPath` 在路径层级上是否位于根目录 `rootDir` 内部（含等于 `rootDir` 本身）。
- *
- * @param rootDir 基准根目录绝对路径。
- * @param targetPath 待校验的目标绝对路径。
- * @returns 位于 `rootDir` 之内时返回 `true`，越界（如 `..` 或跨盘符）时返回 `false`。
- */
+/** 判断绝对路径 `targetPath` 在路径层级上是否位于根目录 `rootDir` 内部（含等于 `rootDir` 本身）。 */
 function isInsideRoot(rootDir: string, targetPath: string): boolean {
   const rel = path.relative(rootDir, targetPath);
   return rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
@@ -2479,8 +2170,10 @@ export function createReadTool(workspace: string) {
           );
         }
       };
-      // 文本与图片的大小上限不同：读入整个文件前先按文件头判断类型；读入后再按实际内容复核一次
-      assertWithinLimit(isSupportedImage(await readFileHead(fullPath, 12)), stat.size);
+      // 文本与图片的大小上限不同：超出文本上限时先按文件头判断类型以提前拦截超大文件；读入后再按实际内容复核一次
+      if (stat.size > MAX_READ_BYTES) {
+        assertWithinLimit(isSupportedImage(await readFileHead(fullPath, 12)), stat.size);
+      }
 
       const buf = await fs.readFile(fullPath, { signal: sig });
       const isImage = isSupportedImage(buf);
