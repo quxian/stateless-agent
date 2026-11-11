@@ -18,7 +18,7 @@ import { randomBytes } from "node:crypto";
  *   历史中含 tool_use/tool_result 时，请求必须定义相应工具（API 要求），宿主应保持工具集与历史一致。
  * - 上下文整理（裁剪、摘要、检索注入、图片替换）由宿主通过 prepareMessages 完成，只影响本次请求，不改写完整历史；
  *   约束见 AgentOptions.prepareMessages。
- * - 单次运行内工具严格串行执行。但工作区按“单写入者”设计：多个 agent 实例、并发直接调用工具或外部编辑器
+ * - 单次运行内工具严格串行执行。但工作区按“单写入者”设计：多个 Agent 实例、并发直接调用工具或外部编辑器
  *   同时修改同一文件时，可能发生“最后提交者覆盖”的丢更新；多写入者场景需要宿主提供文件级协调或版本冲突检测。
  * - 路径检查只用于防误操作，不是安全沙箱（存在 TOCTOU 窗口、硬链接不受约束、bash 可执行任意命令）。
  *   用于不可信代码或多租户环境时，隔离必须由操作系统权限、容器等执行环境承担。
@@ -29,7 +29,7 @@ import { randomBytes } from "node:crypto";
  *   长会话中历史的压缩/裁剪由宿主负责（prepareMessages）。图片处理依赖 sharp，在首次读图时才加载。
  * - 取消：宿主收到 SIGTERM/SIGINT 时应对每次运行的 AbortController 调用 abort() 并等待 runAgent 结束，
  *   以便子进程组完成 SIGTERM→SIGKILL 清理；模块内的 process "exit" 兜底只做同步 SIGKILL，不能替代完整关闭流程。
- * - 完成与取消同时发生（最终 assistant 已完整返回、保存期间触发取消）时，以完成为准，stopReason 报告模型的停止原因。
+ * - 完成与取消同时发生（无需继续工具循环的最终 assistant 回复已完整返回、保存期间触发取消）时，以完成为准，stopReason 报告模型的停止原因。
  * - 平台：bash 工具仅支持 POSIX（依赖 /bin/bash 与进程组语义），已在 macOS 与 Linux 上做过本地执行测试；
  *   Windows 上 bash 工具直接报错，核心循环与其他工具不受影响。
  */
@@ -49,7 +49,7 @@ const MAX_BASH_LOG_BYTES = 64 * 1024 * 1024;
 const KILL_GRACE_MS = 2_000;
 const IO_DRAIN_GRACE_MS = 200;
 const GROUP_POLL_MS = 40;
-// bash 执行中进度报告的节流间隔与单次增量的字符上限（超出时只保留末尾并注明跳过量）
+// bash 执行中进度报告的节流间隔与单次增量的字符上限（超出时只保留末尾并注明省略量）
 const BASH_PROGRESS_INTERVAL_MS = 250;
 const BASH_PROGRESS_MAX_CHARS = 8_192;
 
@@ -92,7 +92,7 @@ export interface AgentToolProgress {
 }
 
 export interface AgentToolContext {
-  // 工具因取消而失败时，应抛出 signal.reason、AbortError，或以 signal.reason 为 cause 的错误，
+  // 工具因取消而失败时，应抛出 signal.reason、name 为 "AbortError" 的错误，或以 signal.reason 为 cause 的错误，
   // 这类错误记为“执行被中断”；其他错误即使发生在取消之后，也按工具自身的确定失败原样记录。
   signal?: AbortSignal;
   toolUseId: string;
@@ -106,7 +106,7 @@ export interface AgentTool<TInput = any> {
   name: string;
   description: string;
   input_schema: Anthropic.Beta.Messages.BetaTool["input_schema"];
-  // 可选的显式缓存断点；设置后视为调用方接管缓存配置，runAgent 不再自动添加默认断点
+  // 可选的显式缓存断点；任一工具设置后即视为调用方接管整体缓存配置，runAgent 不再为 system/tools/messages 自动添加默认断点
   cache_control?: Anthropic.Beta.Messages.BetaTool["cache_control"];
   parse: (input: unknown) => TInput;
   run: (
@@ -115,9 +115,16 @@ export interface AgentTool<TInput = any> {
   ) => Promise<ToolOutput | AgentToolResult> | ToolOutput | AgentToolResult;
 }
 
+// 观察事件分为两个阶段：
+// 1. 模型流式生成阶段（thinking_delta / text_delta / tool_call_start / tool_input_delta）：随模型输出实时发出。
+//    tool_call_start 在模型开始输出某个 tool_use 块时触发，tool_input_delta 随参数原始 JSON 片段（非空 partial_json）到达触发；
+//    若流中途取消/报错、因 max_tokens 等原因截断、工具名未知或同批前序工具执行后已取消，已发出流式事件的调用不会进入本地执行阶段。
+// 2. 本地工具执行阶段（tool_start / tool_progress / tool_end）：在完整响应到达后按串行执行顺序发出；每次 tool_start 必有配对的 tool_end。
 export type AgentEvent =
   | { type: "thinking_delta"; delta: string }
   | { type: "text_delta"; delta: string }
+  | { type: "tool_call_start"; id: string; name: string }
+  | { type: "tool_input_delta"; id: string; name: string; delta: string }
   | { type: "tool_start"; id: string; name: string; input: unknown }
   | { type: "tool_progress"; id: string; name: string; text?: string; details?: unknown }
   | { type: "tool_end"; id: string; name: string; isError: boolean; outputSummary: string; details?: unknown };
@@ -150,20 +157,20 @@ export interface AgentOptions {
   maxTokens?: number;
   maxTurns?: number;
   thinking?: Anthropic.Beta.Messages.BetaThinkingConfigParam;
-  // 是否自动添加默认 ephemeral 缓存断点（默认 true）。每次请求按最终发送的消息与 tools 判断：
-  // 两者均无显式 cache_control 时才自动添加；设为 false 只是不再自动添加，调用方自带的 cache_control 仍原样发送。
+  // 是否自动在 system、末尾工具与末尾消息上添加默认 ephemeral 缓存断点（默认 true）。每次请求按最终发送的消息与 tools 判断：
+  // 任一处已有显式 cache_control 时即整体跳过全部默认断点（避免超出 API 断点上限）；设为 false 仅关闭自动添加，已有配置仍原样发送。
   autoCacheBreakpoints?: boolean;
   signal?: AbortSignal;
   // 本次运行每新增一条完整消息时按序调用（请勿就地修改消息对象）；若抛错将中止后续动作并通过 AgentRunError 带出快照。
   // 该 Promise 会被完整等待，不会因 signal 取消而被放弃——宿主需自行保证保存操作有合理期限。
   // 这是“完整消息”持久化点而非工具事务日志：同一批次中已完成工具的结果，要等整批结束后才作为一条消息落盘。
   onMessage?: (message: Readonly<Anthropic.Beta.Messages.BetaMessageParam>) => void | Promise<void>;
-  // 观察侧事件回调：同步异常与异步拒绝均被隔离，不阻塞主流程返回（runAgent 返回时异步回调可能尚未完成，需要可靠投递的宿主自行排队/flush）
+  // 观察侧事件回调：同步异常与异步拒绝均被隔离，不阻塞主流程返回（runAgent 返回时异步回调可能尚未完成，需要可靠投递的宿主应自行排队并等待处理完成）
   onEvent?: (event: AgentEvent) => void | Promise<void>;
   // 每次模型请求（含第一次）之前调用，返回本次实际发送的消息；只影响本次请求，完整历史保持不变。
   // 用于裁剪/摘要较早历史、注入临时检索材料、替换旧图片等。约束（违反时以 AgentRunError 中止）：
-  // - 进行中的工具回合（最后一条含 tool_use 的 assistant 回合及其后全部消息）必须原样位于返回结果末尾——
-  //   开启 thinking 时该回合的 thinking 签名必须原样回传；临时材料可插在它之前。最后的 assistant 回合不含 tool_use 时不受此限。
+  // - 进行中的工具回合（当历史中最后一个 assistant 回合含 tool_use 时，从该回合首条消息到末尾的全部消息）必须原样位于返回结果末尾——
+  //   开启 thinking 时该回合的 thinking 签名必须原样回传；临时材料可插在它之前。最后一个 assistant 回合不含 tool_use 时无此限制。
   // - 每个 tool_result 都必须对应紧邻其前的 assistant 回合中的 tool_use（裁剪时成对删除）。
   // 这里只校验本地消息结构与进行中的工具回合；模型相关的 thinking 前缀绑定约束仍由宿主满足：
   // 部分模型的 thinking 还绑定生成它时的 system、tools 与之前的消息，保留 thinking 块原样并不保证可以改写它之前的上下文。
@@ -176,7 +183,7 @@ export interface AgentOptions {
     context: PrepareMessagesContext
   ) => Promise<Anthropic.Beta.Messages.BetaMessageParam[]> | Anthropic.Beta.Messages.BetaMessageParam[];
   // 每轮整批工具结果落盘后调用的增量上下文钩子（批次之后的刷新点，而非每个工具调用之前的检查点）；
-  // 返回的文本作为 user 消息写入完整历史。非取消异常将中止运行以防遗漏关键指令。
+  // 返回非空字符串时作为 user 消息写入完整历史（返回 null 或空字符串则忽略）。非取消异常将中止运行以防遗漏关键指令。
   // 覆盖范围：运行开始时与模型给出最终回复（无工具调用）之后都不会调用；同一批次中，后面的工具在钩子之前就已执行。
   // 因此它不能替代“副作用发生前检查最新状态”——例如发送消息前检查是否有新指令，应放在该工具内部、紧邻实际副作用处。
   getContextInjection?: (context: { signal?: AbortSignal }) => Promise<string | null>;
@@ -185,12 +192,14 @@ export interface AgentOptions {
 export interface AgentResult {
   // 调用方历史 + 本次运行新增的消息（含末尾恢复消息）。
   // 注意：历史中段缺失工具结果的补全只存在于每次请求的副本中，不会写回这里，也不会经过 onMessage。
-  // 只有完整取得的 assistant 响应才会写入：流中途出错或取消时，已通过 text_delta/thinking_delta 展示的部分输出
-  // 不会出现在这里；需要保留“用户已看到的内容”的宿主，应在展示记录中自行保存，而不是把半成品当作模型上下文。
+  // 只有完整取得的 assistant 响应才会写入：流中途出错或取消时，已通过流式事件（thinking_delta/text_delta/tool_call_start/tool_input_delta）
+  // 发出的部分输出不会出现在这里；需要保留“用户已看到的内容”的宿主，应在展示记录中自行保存，而不是把半成品当作模型上下文。
   // 请求级重试由注入的 Anthropic 客户端配置（如 maxRetries）负责，runAgent 不做整轮重试。
   messages: Anthropic.Beta.Messages.BetaMessageParam[];
+  // 本次运行最后一条完整 assistant 响应中的文本（多段以 "\n" 拼接；该响应无文本块或本次未取得响应时为 ""，不回溯传入的初始历史）
   lastText: string;
   stopReason: AgentStopReason;
+  // 本次运行实际发起的模型请求次数（发出请求即计入，含流中途取消的轮次）
   turns: number;
   usage: AgentUsage;
 }
@@ -249,7 +258,7 @@ function sliceStringSafe(str: string, maxChars: number): string {
   return str.slice(0, end);
 }
 
-// 节流的增量文本进度：push 累积新文本，每个间隔最多报告一次；累积超过上限时只保留末尾并注明跳过量。
+// 节流的增量文本进度：push 累积新文本，每个间隔最多报告一次；累积超过上限时只保留末尾并注明省略量。
 // flush 立即报告剩余内容并停止计时（工具返回前调用）。
 function createThrottledTextReporter(report: (progress: AgentToolProgress) => void): {
   push: (text: string) => void;
@@ -262,7 +271,7 @@ function createThrottledTextReporter(report: (progress: AgentToolProgress) => vo
     clearTimeout(timer);
     timer = undefined;
     if (!pending && !skipped) return;
-    const text = skipped > 0 ? `[... ${skipped} chars skipped ...]\n${pending}` : pending;
+    const text = skipped > 0 ? `[... 已省略 ${skipped} 个字符 ...]\n${pending}` : pending;
     pending = "";
     skipped = 0;
     report({ text });
@@ -345,23 +354,23 @@ export class HeadTailBuffer {
     if (!this.isTruncated) {
       return stripTrailingNewline(Buffer.concat([this.head, this.tail]).toString("utf-8"));
     }
-    // 省略量按解码后的字节计算（与 head/tail 同一口径）；total 为原始字节数
+    // 省略量按解码后的字节计算（与 head/tail 同一口径）；总输出（totalBytes）为原始字节数
     const omitted = Math.max(1, this.decodedBytes - this.head.length - this.tail.length);
     const logNote = savedLog
-      ? ` ${savedLog.complete ? "Full output" : `Output prefix (up to ${MAX_BASH_LOG_BYTES} bytes)`} saved to: ${savedLog.path} ` +
-        `(inspect it with bash, e.g. rg/grep -n, sed -n 'X,Yp', tail).`
+      ? `；${savedLog.complete ? "完整输出" : `开头 ${formatBytes(MAX_BASH_LOG_BYTES)} 输出（超出上限部分未记录）`}已保存至 ${savedLog.path}` +
+        `（可用 bash 检索或分段查看，如 rg/grep -n、sed -n 'X,Yp'、tail）`
       : "";
     return stripTrailingNewline(
       [
         this.head.toString("utf-8"),
-        `\n... [Omitted ${omitted} bytes in the middle (total output: ${this.totalBytes} bytes).${logNote}] ...\n`,
+        `\n... [中间已省略 ${omitted} 字节，总输出 ${this.totalBytes} 字节${logNote}] ...\n`,
         this.tail.toString("utf-8"),
       ].join("")
     );
   }
 }
 
-// 完整输出日志：输出接近头尾摘要容量前只在内存暂存（不超过约 48 KiB），超过后才创建日志文件，
+// 输出日志（单文件上限 MAX_BASH_LOG_BYTES）：输出接近头尾摘要容量前只在内存暂存（不超过约 48 KiB），超过后才创建日志文件，
 // 先写入暂存内容，再流式追加后续输出。写入的是与 HeadTailBuffer 相同的已解码文本，
 // 达到 MAX_BASH_LOG_BYTES 后停止写入。任何日志 I/O 失败只会让日志不可用，不影响命令结果。
 class BashOutputLog {
@@ -468,11 +477,11 @@ function sendProcessGroupSignal(pid: number | undefined, sig: NodeJS.Signals): v
 }
 
 export interface BashRunOptions {
-  // 在继承 process.env 的基础上覆盖这些变量；传入 {} 不会得到干净环境，不能当作白名单
+  // 在继承 process.env 的基础上覆盖这些变量（CI、GIT_PAGER、GIT_TERMINAL_PROMPT 固定强制设为非交互值）；传入 {} 不会得到干净环境，不能当作白名单
   env?: NodeJS.ProcessEnv;
   signal?: AbortSignal;
-  // 输出超出头尾摘要时保存完整日志的目录（按需调用，仅在确实需要创建日志时才求值）；
-  // 省略则不保存日志。日志保留到宿主清理为止；取消或启动失败时不保留。
+  // 输出超出头尾摘要时保存输出日志的目录（按需调用，仅在确实需要创建日志时才求值）；
+  // 省略则不保存日志。单个日志上限 64 MiB，保留到宿主清理为止（超时截断时也会保留并在错误消息中注明路径；取消、启动失败或未截断时不保留）。
   logDir?: () => string;
   // 每段已解码输出（stdout/stderr 按到达顺序）的同步观察回调，异常被隔离；用于进度展示，不影响结果
   onOutput?: (text: string) => void;
@@ -495,7 +504,7 @@ export function runBashProcessGroup(
   const { env: customEnv, signal, logDir, onOutput } = options;
   return new Promise((resolve, reject) => {
     if (process.platform === "win32") {
-      return reject(new Error("bash tool requires a POSIX platform (/bin/bash and process groups)."));
+      return reject(new Error("bash 工具仅支持 POSIX 平台（依赖 /bin/bash 与进程组）。"));
     }
     if (signal?.aborted) {
       return reject(signal.reason);
@@ -585,7 +594,7 @@ export function runBashProcessGroup(
         if (spawnErr) return reject(spawnErr);
         if (aborted) return reject(signal?.reason); // 原样传递取消原因（可能是 null 等任意值）
         if (timedOut) {
-          return reject(new Error(`Command timed out after ${timeoutMs}ms.\n${output}`));
+          return reject(new Error(`命令执行超时（超过 ${timeoutMs}ms 已终止）${output ? `：\n${output}` : "。"}`));
         }
         resolve({ exitCode, exitSignal, output, ...(savedLog ? { log: savedLog } : {}) });
       });
@@ -617,7 +626,7 @@ export function runBashProcessGroup(
       groupPollTimer = setInterval(checkGroupDead, GROUP_POLL_MS);
       groupPollTimer.unref?.();
 
-      // 注意：killEscalationTimer 保持 ref 状态（不调用 unref），防止 CLI 在等待强杀完成前提前退出事件循环
+      // 注意：killEscalationTimer 保持 ref 状态（不调用 unref），防止宿主进程在等待强杀完成前提前退出事件循环
       killEscalationTimer = setTimeout(() => {
         clearInterval(groupPollTimer);
         sendProcessGroupSignal(pid, "SIGKILL");
@@ -680,7 +689,7 @@ async function resolveExistingRealPath(targetPath: string): Promise<string> {
       if (errnoCode(err) === "ENOENT") {
         const st = await fs.lstat(current).catch(() => null);
         if (st?.isSymbolicLink()) {
-          throw new Error(`Dangling symlink blocked: ${targetPath}`);
+          throw new Error(`拒绝访问悬空符号链接（目标不存在）：${targetPath}`);
         }
         const parent = path.dirname(current);
         if (parent === current) return path.resolve(targetPath);
@@ -695,12 +704,12 @@ async function resolveExistingRealPath(targetPath: string): Promise<string> {
 
 function decodeStrictUtf8(buf: Buffer, filePath: string): string {
   if (buf.subarray(0, 1024).includes(0)) {
-    throw new Error(`Binary file detected: ${filePath}. Cannot process as UTF-8 text.`);
+    throw new Error(`检测到二进制文件：${filePath}，无法作为 UTF-8 文本处理。`);
   }
   try {
     return utf8FatalDecoder.decode(buf);
   } catch {
-    throw new Error(`File is not valid UTF-8 text: ${filePath}.`);
+    throw new Error(`文件不是合法的 UTF-8 文本：${filePath}。`);
   }
 }
 
@@ -729,7 +738,7 @@ async function loadSharp(): Promise<typeof import("sharp").default> {
   try {
     return (await import("sharp")).default;
   } catch (err) {
-    throw new Error("Image support requires the 'sharp' package, which failed to load.", { cause: err });
+    throw new Error("读取图片依赖 'sharp' 包，但加载失败。", { cause: err });
   }
 }
 
@@ -785,7 +794,7 @@ async function readImage(buf: Buffer, filePath: string, signal?: AbortSignal): P
     return [
       {
         type: "text",
-        text: `Read image ${filePath}: ${metadata.width}x${metadata.height}; sent as ${mediaType} with the original encoding preserved.`,
+        text: `已读取图片 ${filePath}：${metadata.width}x${metadata.height}，未重编码，直接以 ${mediaType} 发送。`,
       },
       { type: "image", source: { type: "base64", media_type: mediaType, data: buf.toString("base64") } },
     ];
@@ -823,7 +832,7 @@ async function readImage(buf: Buffer, filePath: string, signal?: AbortSignal): P
   }
   if (base64Length(result.data.length) > MAX_IMAGE_BASE64_CHARS) {
     throw new Error(
-      `Image exceeds ${MAX_IMAGE_BASE64_CHARS} Base64 characters after processing: ${filePath}. Resize it before reading.`
+      `图片经缩放压缩后仍超过 ${MAX_IMAGE_BASE64_CHARS} 个 Base64 字符上限：${filePath}。请进一步缩小尺寸或压缩后再读取。`
     );
   }
   const data = result.data.toString("base64");
@@ -831,14 +840,14 @@ async function readImage(buf: Buffer, filePath: string, signal?: AbortSignal): P
   const mediaType =
     result.info.format === "jpeg" ? "image/jpeg" : result.info.format === "webp" ? "image/webp" : "image/png";
   const notes = [
-    `Read image ${filePath}: ${metadata.autoOrient.width}x${metadata.autoOrient.height} after orientation; ` +
-      `sent ${result.info.width}x${result.info.height} as ${mediaType}.`,
+    `已读取图片 ${filePath}：原图转正后尺寸 ${metadata.autoOrient.width}x${metadata.autoOrient.height}，` +
+      `实际发送尺寸 ${result.info.width}x${result.info.height}（${mediaType}）。`,
   ];
-  if ((metadata.pages ?? 1) > 1) notes.push("Only the first frame is included.");
-  if (compressed) notes.push("JPEG compression was applied to fit the image size budget.");
-  if (flattened) notes.push("Transparency was composited onto a white background.");
+  if ((metadata.pages ?? 1) > 1) notes.push("仅取第一帧。");
+  if (compressed) notes.push("为控制在传输体积上限内，已转为 JPEG 压缩。");
+  if (flattened) notes.push("透明区域已铺白底合成。");
   return [
-    { type: "text", text: notes.join(" ") },
+    { type: "text", text: notes.join("") },
     { type: "image", source: { type: "base64", media_type: mediaType, data } },
   ];
 }
@@ -850,18 +859,18 @@ async function readImage(buf: Buffer, filePath: string, signal?: AbortSignal): P
 // - 只保留普通 rwx 权限位；setuid/setgid/sticky、属主/属组、ACL、xattr 不保留。
 // - 目标已存在但当前进程不可写（如 0444）时拒绝，保持与直接写入相同的语义——rename 只看目录权限，
 //   否则会悄悄覆盖用户设为只读的文件。该检查与 rename 之间仍有时间窗口，仅防误操作。
-// - targetPath 应为已解析的真实路径：工作区内的 symlink 因此被保留；硬链接会被解绑（目标路径指向新 inode）。
+// - targetPath 应为已解析的真实路径：工作区内的符号链接因此被保留；硬链接会被解绑（目标路径指向新 inode）。
 async function atomicWriteFile(targetPath: string, content: string, signal?: AbortSignal): Promise<void> {
   const existing = await fs.stat(targetPath).catch((err: unknown) => {
     if (errnoCode(err) === "ENOENT") return null;
     throw err;
   });
   if (existing && !existing.isFile()) {
-    throw new Error(`Cannot overwrite non-regular file: ${targetPath}`);
+    throw new Error(`目标不是普通文件（如目录或特殊文件），无法覆盖：${targetPath}`);
   }
   if (existing) {
     await fs.access(targetPath, fs.constants.W_OK).catch(() => {
-      throw new Error(`Permission denied: file is not writable: ${targetPath}`);
+      throw new Error(`权限被拒绝，文件不可写：${targetPath}`);
     });
   }
 
@@ -936,7 +945,7 @@ function defineTool<S extends z.ZodObject>(spec: {
 // 返回绑定到同一工作区根目录的 read / write / edit / bash 工具。
 // 工具本身与代码无关（不做语法分析），以 workspace 为边界；read 支持文本与图片，write/edit 面向 UTF-8 文本。
 // 取消信号由每次调用的 AgentToolContext.signal 提供。
-// bashLogDir：bash 输出被截断时保存完整日志的目录（相对路径基于 workspace）。
+// bashLogDir：bash 输出被截断时保存输出日志的目录（相对路径基于 workspace，单个日志上限 64 MiB）。
 // - 省略：首次需要时在系统临时目录下创建本实例专用目录（agent-bash-logs-XXXXXX）；该目录在工作区外，
 //   read 工具会拒绝读取，模型需用 bash 检索；若希望 read 可读，宿主可将其设为工作区内的目录。
 // - null：不保存日志，仅返回头尾摘要。
@@ -960,19 +969,19 @@ export function createWorkspaceTools(
     return rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
   };
 
-  // 路径检查用于防止误操作（目录穿越、指向工作区外的 symlink），不是安全沙箱：
+  // 路径检查用于防止误操作（目录穿越、指向工作区外的符号链接），不是安全沙箱：
   // 检查与后续按路径打开之间存在 TOCTOU 窗口，硬链接也不受 realpath 约束，且 bash 工具本身可执行任意命令。
-  // 返回已解析 symlink 的真实路径，后续读写均基于该路径，避免二次跟随链接，并让原子写入保留工作区内的 symlink。
+  // 返回已解析符号链接的真实路径，后续读写均基于该路径，避免二次跟随链接，并让原子写入保留工作区内的符号链接。
   const resolveWorkspacePath = async (filePath: string): Promise<string> => {
     const resolved = path.resolve(root, filePath);
     if (!isInsideRoot(root, resolved)) {
-      throw new Error(`Path is outside workspace (${root}): ${filePath}`);
+      throw new Error(`路径超出工作区范围（${root}）：${filePath}`);
     }
 
     const realRoot = await resolveExistingRealPath(root);
     const realTarget = await resolveExistingRealPath(resolved);
     if (!isInsideRoot(realRoot, realTarget)) {
-      throw new Error(`Symlink escape blocked: ${filePath} resolves outside workspace (${realTarget})`);
+      throw new Error(`拒绝访问越界符号链接：${filePath} 指向工作区之外（${realTarget}）`);
     }
     return realTarget;
   };
@@ -980,9 +989,9 @@ export function createWorkspaceTools(
   const readTool = defineTool({
     name: "read",
     description:
-      `Read a UTF-8 text file (up to ${formatBytes(MAX_READ_BYTES)}) or a JPEG, PNG, GIF, or WebP image (up to ${formatBytes(MAX_IMAGE_FILE_BYTES)}). ` +
-      "Text supports 1-based line offset and limit. Images ignore offset/limit, are auto-oriented and resized to fit " +
-      `${MAX_IMAGE_EDGE}x${MAX_IMAGE_EDGE} without cropping or enlargement; only the first frame is sent. Images require a vision-capable model.`,
+      `读取 UTF-8 文本文件（上限 ${formatBytes(MAX_READ_BYTES)}）或 JPEG、PNG、GIF、WebP 图片（上限 ${formatBytes(MAX_IMAGE_FILE_BYTES)}）。` +
+      `文本支持起始行号 offset（从 1 开始）与最大读取行数 limit。图片忽略 offset/limit，会自动转正并等比缩放至 ` +
+      `${MAX_IMAGE_EDGE}x${MAX_IMAGE_EDGE} 以内（不裁剪、不放大），仅发送第一帧；读取图片需要支持视觉能力的模型。`,
     inputSchema: z.object({
       file_path: z.string().min(1),
       offset: z.number().int().min(1).optional(),
@@ -993,18 +1002,18 @@ export function createWorkspaceTools(
       const fullPath = await resolveWorkspacePath(file_path);
       const stat = await fs.stat(fullPath);
       if (!stat.isFile()) {
-        throw new Error(`Cannot read non-regular file: ${file_path}`);
+        throw new Error(`目标不是普通文件（如目录或特殊文件），无法读取：${file_path}`);
       }
       // 文本与图片的大小上限不同：读入整个文件前先按文件头判断类型；读入后再按实际内容复核一次
       const assertWithinLimit = (isImage: boolean, size: number) => {
         if (isImage && size > MAX_IMAGE_FILE_BYTES) {
           throw new Error(
-            `Image file size (${size} bytes) exceeds ${formatBytes(MAX_IMAGE_FILE_BYTES)} limit: ${file_path}. Resize it before reading.`
+            `图片文件大小（${size} 字节）超过 ${formatBytes(MAX_IMAGE_FILE_BYTES)} 上限：${file_path}。请先压缩或缩小图片后再读取。`
           );
         }
         if (!isImage && size > MAX_READ_BYTES) {
           throw new Error(
-            `File size (${size} bytes) exceeds ${formatBytes(MAX_READ_BYTES)} limit. Use bash tools (head/tail/rg) instead.`
+            `文件大小（${size} 字节）超过 ${formatBytes(MAX_READ_BYTES)} 上限，请改用 bash 工具（如 head/tail/rg）读取。`
           );
         }
       };
@@ -1018,7 +1027,7 @@ export function createWorkspaceTools(
       // 展示时去掉 UTF-8 BOM（不可见字符，避免模型将其复制进 old_text）；edit 仍会原样保留文件中的 BOM
       const text = stripLeadingBom(decodeStrictUtf8(buf, file_path));
       if (text.length === 0) {
-        return "(empty file)";
+        return "（空文件）";
       }
 
       const lines = text.split(/\r?\n/);
@@ -1026,7 +1035,7 @@ export function createWorkspaceTools(
       if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
       const start = (offset ?? 1) - 1;
       if (start >= lines.length) {
-        return `(offset ${offset} is beyond end of file; total lines: ${lines.length})`;
+        return `（offset ${offset} 超出文件末尾；总行数：${lines.length}）`;
       }
 
       const end = limit ? Math.min(start + limit, lines.length) : lines.length;
@@ -1050,18 +1059,21 @@ export function createWorkspaceTools(
       const numbered = parts.join("");
 
       if (truncated) {
+        const shownRange =
+          completeLines === 1 ? `第 ${start + 1} 行` : `第 ${start + 1}-${start + completeLines} 行`;
         const hint =
           completeLines > 0
-            ? `Lines ${start + 1}-${start + completeLines} shown completely; continue with offset=${start + completeLines + 1}.`
-            : `Line ${start + 1} alone exceeds the limit and cannot be read further with this tool; use bash (e.g. \`sed -n '${start + 1}p' FILE | cut -c 1-20000\`) to read it in segments.`;
-        return numbered + `\n... [Truncated at ${MAX_READ_CHARS} chars. File has ${lines.length} total lines. ${hint}]`;
+            ? `${shownRange}已完整显示；可指定 offset=${start + completeLines + 1} 继续读取。`
+            : `第 ${start + 1} 行单行即超过字符上限，无法用此工具继续读取；请改用 bash（如 \`sed -n '${start + 1}p' <文件路径> | cut -c 1-20000\`）分段读取。`;
+        return numbered + `\n... [已在 ${MAX_READ_CHARS} 字符处截断。文件共 ${lines.length} 行。${hint}]`;
       }
       if (end < lines.length) {
         const remaining = lines.length - end;
+        const shownRange = start + 1 === end ? `第 ${end} 行` : `第 ${start + 1}-${end} 行`;
         return (
           numbered +
-          `\n... [Showing lines ${start + 1}-${end} of ${lines.length}; ${remaining} more line${remaining === 1 ? "" : "s"}. ` +
-          `Continue with offset=${end + 1}.]`
+          `\n... [当前显示${shownRange}（共 ${lines.length} 行），剩余 ${remaining} 行。` +
+          `可指定 offset=${end + 1} 继续读取。]`
         );
       }
       return numbered;
@@ -1070,7 +1082,7 @@ export function createWorkspaceTools(
 
   const writeTool = defineTool({
     name: "write",
-    description: "Create a new file or overwrite an existing regular file completely.",
+    description: "创建新文件（自动创建不存在的父目录），或完整覆盖已有的普通文件。",
     inputSchema: z.object({
       file_path: z.string().min(1),
       content: z.string(),
@@ -1080,7 +1092,7 @@ export function createWorkspaceTools(
       const fullPath = await resolveWorkspacePath(file_path);
       await fs.mkdir(path.dirname(fullPath), { recursive: true });
       await atomicWriteFile(fullPath, content, sig);
-      return `Successfully wrote ${Buffer.byteLength(content, "utf8")} bytes to ${file_path}`;
+      return `已成功向 ${file_path} 写入 ${Buffer.byteLength(content, "utf8")} 字节`;
     },
   });
 
@@ -1094,30 +1106,29 @@ export function createWorkspaceTools(
   const editTool = defineTool({
     name: "edit",
     description:
-      "Replace one or more exact, unique text blocks in an existing UTF-8 file in a single atomic write. " +
-      "Every old_text is matched against the original file content (not against the result of earlier edits), " +
-      "must match exactly once, and must not overlap any other edit; if any edit fails, nothing is written. " +
-      "In files that use CRLF line endings exclusively, newlines in new_text are written as CRLF.",
+      "精确替换已有 UTF-8 文件中的一处或多处文本，并一次原子写入。" +
+      "每个 old_text 均在修改前的原文件上匹配（而非前序编辑的结果），必须在原文件中唯一命中，且各处匹配范围互不重叠；" +
+      "任一项失败则整体不写入。若原文件全部采用 CRLF 换行，new_text 中的换行会自动转为 CRLF。",
     inputSchema: z.object({
       file_path: z.string().min(1),
       edits: z
         .array(
           z.object({
-            old_text: z.string().min(1, "old_text cannot be empty"),
+            old_text: z.string().min(1, "old_text 不能为空"),
             new_text: z.string(),
           })
         )
-        .min(1, "edits must contain at least one edit"),
+        .min(1, "edits 至少需要包含一项编辑"),
     }),
     run: async ({ file_path, edits }, { signal: sig }) => {
       sig?.throwIfAborted();
       const fullPath = await resolveWorkspacePath(file_path);
       const stat = await fs.stat(fullPath);
       if (!stat.isFile()) {
-        throw new Error(`Cannot edit non-regular file: ${file_path}`);
+        throw new Error(`目标不是普通文件（如目录或特殊文件），无法编辑：${file_path}`);
       }
       if (stat.size > MAX_READ_BYTES) {
-        throw new Error(`File size (${stat.size} bytes) exceeds ${formatBytes(MAX_READ_BYTES)} limit.`);
+        throw new Error(`文件大小（${stat.size} 字节）超过 ${formatBytes(MAX_READ_BYTES)} 上限。`);
       }
 
       const buf = await fs.readFile(fullPath, { signal: sig });
@@ -1126,7 +1137,7 @@ export function createWorkspaceTools(
       const hasCrLf = rawContent.includes("\r\n");
       const hasBareLf = rawContent.replace(/\r\n/g, "").includes("\n");
       const isPureCrLfFile = hasCrLf && !hasBareLf;
-      const label = (i: number) => (edits.length === 1 ? "'old_text'" : `edits[${i}].old_text`);
+      const label = (i: number) => (edits.length === 1 ? "old_text" : `edits[${i}].old_text`);
 
       const located = edits.map(({ old_text, new_text }, i) => {
         let targetOld = old_text;
@@ -1147,11 +1158,11 @@ export function createWorkspaceTools(
         }
 
         if (matches.length === 0) {
-          throw new Error(`${label(i)} not found in ${file_path}. Read the file first to verify exact text. No edits were applied.`);
+          throw new Error(`在 ${file_path} 中未匹配到指定的 ${label(i)}。请先读取文件确认精确原文。文件未做任何修改。`);
         }
         if (matches.length > 1) {
           throw new Error(
-            `${label(i)} matched multiple locations in ${file_path}. Include more surrounding lines. No edits were applied.`
+            `指定的 ${label(i)} 在 ${file_path} 中命中多处。请补充更多前后上下文行以唯一定位。文件未做任何修改。`
           );
         }
 
@@ -1166,8 +1177,8 @@ export function createWorkspaceTools(
         const cur = located[k];
         if (cur.start < prev.end) {
           throw new Error(
-            `edits[${prev.index}] and edits[${cur.index}] overlap in ${file_path}. ` +
-              `Merge them into one edit or choose non-overlapping old_text. No edits were applied.`
+            `edits[${prev.index}] 与 edits[${cur.index}] 在 ${file_path} 中的匹配范围重叠。` +
+              `请合并为同一项编辑，或改用互不重叠的 old_text。文件未做任何修改。`
           );
         }
       }
@@ -1182,7 +1193,7 @@ export function createWorkspaceTools(
       const updated = parts.join("");
 
       if (updated === rawContent) {
-        throw new Error(`No changes made to ${file_path}: the combined edits produce identical content.`);
+        throw new Error(`编辑未对 ${file_path} 产生任何改动：替换后的内容与原文件完全一致。`);
       }
 
       // rawContent 保留了 BOM（见 utf8FatalDecoder），写回时原样保留
@@ -1196,8 +1207,8 @@ export function createWorkspaceTools(
       return {
         content:
           edits.length === 1
-            ? `Successfully edited ${file_path}`
-            : `Successfully applied ${edits.length} edits to ${file_path}`,
+            ? `已成功编辑 ${file_path}`
+            : `已成功对 ${file_path} 应用 ${edits.length} 处编辑`,
         details: { path: file_path, edits: edits.length, firstChangedLine },
       };
     },
@@ -1206,17 +1217,16 @@ export function createWorkspaceTools(
   const bashTool = defineTool({
     name: "bash",
     description:
-      "Execute a foreground bash command in the workspace. Background child processes in the same process group are terminated when the command exits. " +
-      `Long output is reduced to its first ${formatBytes(BASH_HEAD_BYTES)} and last ${formatBytes(BASH_TAIL_BYTES)}` +
+      "在工作区中执行前台 bash 命令；命令退出时，同一进程组内的后台子进程会被一并终止。" +
+      `输出过长时仅保留开头 ${formatBytes(BASH_HEAD_BYTES)} 与末尾 ${formatBytes(BASH_TAIL_BYTES)}` +
       (resolveBashLogDir
-        ? `. Output logging is best-effort and limited to ${formatBytes(MAX_BASH_LOG_BYTES)}; when a log is available, ` +
-          "its path and whether it is complete are included in the result."
-        : "."),
+        ? `，并尽力将输出另存为日志文件（上限 ${formatBytes(MAX_BASH_LOG_BYTES)}）；若保存成功，结果中会注明日志路径及是否完整。`
+        : "。"),
     inputSchema: z.object({
       command: z.string().min(1),
       timeout_ms: z.number().int().min(100).max(300_000).optional(),
     }),
-    // 非零退出不抛错：返回 isError 结果，模型看到的文本与原先一致，宿主另从 details 取得退出码与日志位置。
+    // 非零退出不抛错：返回带 isError 的结构化结果，content 供模型阅读，宿主另从 details 取得退出码、信号与日志信息。
     // 执行期间按 BASH_PROGRESS_INTERVAL_MS 节流，把新增输出作为 tool_progress 的 text 报告（增量，过多时只保留末尾）。
     run: async ({ command, timeout_ms }, { signal: sig, reportProgress }) => {
       const progress = reportProgress ? createThrottledTextReporter(reportProgress) : undefined;
@@ -1236,12 +1246,19 @@ export function createWorkspaceTools(
       if (exitCode !== 0) {
         const statusDesc =
           exitCode !== null
-            ? `exit code ${exitCode}`
-            : `signal ${exitSignal ?? "UNKNOWN"}`;
-        const body = output || `(Command terminated by ${statusDesc} with no output)`;
-        return { content: `Command failed with ${statusDesc}:\n${body}`, isError: true, details };
+            ? `退出码 ${exitCode}`
+            : exitSignal
+              ? `信号 ${exitSignal}`
+              : "未知信号";
+        const emptyNote =
+          exitCode !== null
+            ? `（命令以退出码 ${exitCode} 退出，无输出）`
+            : exitSignal
+              ? `（命令因信号 ${exitSignal} 终止，无输出）`
+              : "（命令因未知信号终止，无输出）";
+        return { content: `命令执行失败（${statusDesc}）：\n${output || emptyNote}`, isError: true, details };
       }
-      return { content: output || "(Command exited with code 0)", details };
+      return { content: output || "（命令正常退出，退出码 0，无输出）", details };
     },
   });
 
@@ -1251,7 +1268,7 @@ export function createWorkspaceTools(
 // ============================================================================
 // 4. 历史回合恢复、请求副本构造与缓存断点、观察快照等辅助函数
 // ============================================================================
-const RECOVERY_RESULT_TEXT = "Recovered from incomplete prior run: tool execution state is unknown.";
+const RECOVERY_RESULT_TEXT = "从上次未完成的运行中恢复：该工具调用的执行状态未知。";
 
 // API 语义下的“回合”：相邻的同角色消息会被服务端合并为一个回合。
 // system 消息不属于任何回合，也不打断回合。
@@ -1363,14 +1380,13 @@ function validatePreparedMessages(
   history: readonly Anthropic.Beta.Messages.BetaMessageParam[]
 ): asserts prepared is Anthropic.Beta.Messages.BetaMessageParam[] {
   if (!Array.isArray(prepared) || prepared.length === 0) {
-    throw new Error("prepareMessages must return a non-empty array of messages.");
+    throw new Error("prepareMessages 必须返回非空的消息数组。");
   }
   const tail = inProgressToolTurn(history);
   const offset = prepared.length - tail.length;
   if (offset < 0 || !tail.every((msg, i) => structurallyEqual(prepared[offset + i], msg))) {
     throw new Error(
-      "prepareMessages must keep the in-progress tool turn (the last assistant turn containing tool_use and every " +
-        "message after it) unchanged at the end of the returned messages."
+      "prepareMessages 必须在返回消息的末尾原样保留进行中的工具回合（当历史中最后一个 assistant 回合含 tool_use 时，从该回合首条消息到末尾的全部消息）。"
     );
   }
 }
@@ -1386,8 +1402,7 @@ function assertToolResultsPaired(messages: readonly Anthropic.Beta.Messages.Beta
     for (const id of collectToolResultIds(messages, turns[t].indices)) {
       if (!known.has(id)) {
         throw new Error(
-          `Request messages contain a tool_result for '${id}' without a matching tool_use in the immediately ` +
-            "preceding assistant turn. When trimming history, remove tool_use and tool_result blocks together."
+          `请求消息中包含 tool_use_id 为 '${id}' 的 tool_result，但紧邻其前缺少包含对应 tool_use 的 assistant 回合。裁剪历史时请成对删除 tool_use 与 tool_result。`
         );
       }
     }
@@ -1518,12 +1533,12 @@ function summarizeToolOutput(output: ToolOutput): string {
     // 图片块只保留类型说明，避免把 Base64 数据塞进观察事件
     const summary = output.map((block) =>
       block.type === "image"
-        ? { type: "text", text: `[Image: ${block.source.type === "base64" ? block.source.media_type : block.source.type}]` }
+        ? { type: "text", text: `[图片: ${block.source.type === "base64" ? block.source.media_type : block.source.type}]` }
         : block
     );
     return sliceStringSafe(JSON.stringify(summary) ?? "", 500);
   } catch {
-    return "[Complex tool output]";
+    return "[复杂工具输出]";
   }
 }
 
@@ -1544,13 +1559,13 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
   } = options;
 
   if (!Number.isInteger(maxTurns) || maxTurns < 1) {
-    throw new Error(`Invalid maxTurns: ${maxTurns}. Must be a positive integer.`);
+    throw new Error(`maxTurns 无效（${maxTurns}）：必须为正整数。`);
   }
 
   const budgetTokens = thinking && "budget_tokens" in thinking ? thinking.budget_tokens : 0;
   const maxTokens = options.maxTokens ?? (budgetTokens ? budgetTokens + 4096 : 8192);
   if (budgetTokens && maxTokens <= budgetTokens) {
-    throw new Error(`maxTokens (${maxTokens}) must be greater than thinking.budget_tokens (${budgetTokens}).`);
+    throw new Error(`maxTokens（${maxTokens}）必须大于 thinking.budget_tokens（${budgetTokens}）。`);
   }
 
   const messages: Anthropic.Beta.Messages.BetaMessageParam[] = [...options.messages];
@@ -1577,8 +1592,8 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
   const systemPrompt =
     options.systemPrompt ??
     (tools.length > 0
-      ? `You are a helpful assistant that can use tools to complete tasks. Available tools: ${toolNamesList}.`
-      : "You are a helpful assistant.");
+      ? `你是一个乐于助人的助手，可以调用工具完成任务。可用工具：${toolNamesList}。`
+      : "你是一个乐于助人的助手。");
 
   let lastText = "";
   let stopReason: AgentStopReason = null;
@@ -1646,22 +1661,48 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
       const apiMessages = buildApiRequestMessages(requestMessages, addDefaultCacheBreakpoints);
       turns++;
 
-      const stream = client.beta.messages
-        .stream(
-          {
-            model,
-            max_tokens: maxTokens,
-            system: addDefaultCacheBreakpoints
-              ? [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }]
-              : systemPrompt,
-            ...(apiTools.length > 0 ? { tools: apiTools } : {}),
-            messages: apiMessages,
-            ...(thinking ? { thinking } : {}),
-          },
-          { signal }
-        )
-        .on("thinking", (delta) => emit(() => ({ type: "thinking_delta", delta })))
-        .on("text", (delta) => emit(() => ({ type: "text_delta", delta })));
+      const stream = client.beta.messages.stream(
+        {
+          model,
+          max_tokens: maxTokens,
+          system: addDefaultCacheBreakpoints
+            ? [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }]
+            : systemPrompt,
+          ...(apiTools.length > 0 ? { tools: apiTools } : {}),
+          messages: apiMessages,
+          ...(thinking ? { thinking } : {}),
+        },
+        { signal }
+      );
+      if (onEvent) {
+        // 直接从底层 streamEvent 读取 tool_use 块起点与原始 partial_json 片段：
+        // SDK 的 contentBlock 在块结束时才触发，而 inputJson 会在每次增量上全量重解析累积 JSON（大参数时退化为 O(n²)）且不带 id/name。
+        const streamingToolCalls = new Map<number, { id: string; name: string }>();
+        stream
+          .on("thinking", (delta) => emit(() => ({ type: "thinking_delta", delta })))
+          .on("text", (delta) => emit(() => ({ type: "text_delta", delta })))
+          .on("streamEvent", (event) => {
+            if (event.type === "message_start") {
+              streamingToolCalls.clear();
+            } else if (event.type === "content_block_start" && event.content_block.type === "tool_use") {
+              const { id, name } = event.content_block;
+              streamingToolCalls.set(event.index, { id, name });
+              emit(() => ({ type: "tool_call_start", id, name }));
+            } else if (
+              event.type === "content_block_delta" &&
+              event.delta.type === "input_json_delta" &&
+              event.delta.partial_json
+            ) {
+              const call = streamingToolCalls.get(event.index);
+              if (call) {
+                const delta = event.delta.partial_json;
+                emit(() => ({ type: "tool_input_delta", id: call.id, name: call.name, delta }));
+              }
+            } else if (event.type === "content_block_stop") {
+              streamingToolCalls.delete(event.index);
+            }
+          });
+      }
 
       let response: Anthropic.Beta.Messages.BetaMessage;
       try {
@@ -1706,8 +1747,8 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
             is_error: true,
             content:
               response.stop_reason === "max_tokens"
-                ? "Tool call was truncated due to hitting max_tokens and was NOT executed. Retry with smaller input."
-                : `Tool call was not executed because generation stopped with reason '${response.stop_reason}'.`,
+                ? "工具调用因达到 max_tokens 输出上限而被截断，未执行。请减小单次工具调用的参数内容（如分批处理）后重试。"
+                : `模型生成因 '${response.stop_reason}' 停止，该工具调用未执行。`,
           });
         }
         if (response.stop_reason !== "max_tokens") {
@@ -1722,7 +1763,7 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
             userContent.push({
               type: "tool_result",
               tool_use_id: block.id,
-              content: "Tool execution was SKIPPED (never started) because the agent run was aborted.",
+              content: "因运行已取消，该工具调用已跳过（未启动）。",
               is_error: true,
             });
             continue;
@@ -1733,7 +1774,7 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
             userContent.push({
               type: "tool_result",
               tool_use_id: block.id,
-              content: `Error: Unknown tool '${block.name}'. Available tools: ${toolNamesList || "(none)"}`,
+              content: `错误：未知工具 '${block.name}'。可用工具：${toolNamesList || "（无）"}`,
               is_error: true,
             });
             continue;
@@ -1750,10 +1791,11 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
           let resultBlock: Anthropic.Beta.Messages.BetaToolResultBlockParam;
           let details: unknown;
           if (signal?.aborted) {
+            // onEvent(tool_start) 同步回调期间可能触发取消：工具尚未执行，跳过运行但仍发出下方配对的 tool_end
             resultBlock = {
               type: "tool_result",
               tool_use_id: block.id,
-              content: "Tool execution was SKIPPED (aborted during tool_start) before running.",
+              content: "因运行在启动前取消，该工具调用已跳过（未执行）。",
               is_error: true,
             };
           } else {
@@ -1790,7 +1832,7 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
               }
             } catch (err: unknown) {
               const errMsg = isAbortCausedError(err, signal)
-                ? "Tool execution was INTERRUPTED after starting because the run was aborted; partial side effects may have occurred. Verify workspace state."
+                ? "因运行已取消，该工具调用在执行中途被中断，可能已产生部分副作用；后续操作前请先核实当前状态。"
                 : err instanceof Error
                   ? err.message
                   : String(err);
@@ -1841,7 +1883,7 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
         }
       }
 
-      // 若在保存注入消息期间触发了取消，优先报告 aborted 而非 max_turns
+      // 若在增量上下文返回或保存注入消息期间触发了取消，优先报告 aborted 而非 max_turns
       if (signal?.aborted) {
         stopReason = "aborted";
         break;
