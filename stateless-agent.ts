@@ -367,7 +367,6 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
   // 宿主显式配置工具缓存时，默认缓存策略整体让位；消息中的显式配置在每次请求时检查。
   const allowDefaultCacheBreakpoints =
     (options.autoCacheBreakpoints ?? true) && !tools.some((tool) => tool.cache_control);
-  const compactionTools = buildApiTools(tools);
 
   const systemPrompt =
     options.systemPrompt ??
@@ -377,7 +376,8 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
 
   let lastText = "";
   let stopReason: AgentStopReason = null;
-  let turns = 0; // 主模型请求次数，包含超窗后的重试，不包含摘要请求。
+  let turns = 0; // 主模型请求次数，包含恢复后的重试，不包含摘要请求。
+  let contextUsage: ContextUsageAnchor | undefined;
   const usage: AgentUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
   /** 累计主请求与摘要请求已取得完整响应的用量；后续校验失败也保留这部分用量。 */
   const addUsage = (completed: Anthropic.Beta.Messages.BetaUsage) => {
@@ -411,26 +411,28 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
     if (trailingRecovery) {
       await appendMessage(trailingRecovery);
     }
+    const fixedInputTokens = estimateText(systemPrompt) + estimateText(JSON.stringify(buildApiTools(tools))) + 16;
 
     while (turns < maxTurns) {
       throwIfAborted(signal);
 
-      // 取得本轮回复：首次请求按需压缩，仅明确超窗时再强制压缩并请求一次。
+      // 取得本轮回复：超窗和思考前缀不匹配各最多恢复一次，均受主请求总额度约束。
       let response: Anthropic.Beta.Messages.BetaMessage;
-      for (let requestAttempt = 0; ; requestAttempt++) {
+      let recovery: "context" | "thinking" | undefined;
+      const recovered = new Set<"context" | "thinking">();
+      for (;;) {
         assertToolResultsPaired(messages);
         const compacted = await compactMessages({
           client,
           model,
           messages,
-          systemPrompt,
-          tools: compactionTools,
+          fixedInputTokens,
+          contextUsage,
           maxTokens,
           contextWindow,
-          thinking,
           signal,
           onUsage: addUsage,
-          force: requestAttempt > 0,
+          force: recovery === "context",
         }).catch((err) => {
           throwIfAborted(signal);
           throw err;
@@ -440,6 +442,7 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
         if (compacted) {
           assertToolResultsPaired(compacted.messages);
           messages = compacted.messages;
+          contextUsage = undefined;
           // 先采用上下文再通知；观察回调触发取消时，快照仍保留本次摘要。
           emit(() => ({
             type: "compaction",
@@ -467,8 +470,26 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
           });
           break;
         } catch (err) {
-          if (requestAttempt > 0 || !isContextOverflow(err) || turns >= maxTurns) throw err;
-          // 这里只重试尚未取得回复的主请求，工具执行位于下方，不会重复执行。
+          if (turns >= maxTurns) throw err;
+          recovery = isContextOverflow(err) ? "context"
+            : thinking?.type !== "enabled" && isThinkingPrefixMismatch(err) && messages.some(hasThinking)
+              ? "thinking" : undefined;
+          if (!recovery || recovered.has(recovery)) throw err;
+          recovered.add(recovery);
+
+          if (recovery === "thinking") {
+            const restored = messages.map(withoutThinking).filter((message): message is Message => message !== null);
+            if (restored.length === 0 || hasBrokenSystemPlacement(messages, restored)) throw err;
+            const previous = messages;
+            messages = restored;
+            contextUsage = undefined;
+            emit(() => ({
+              type: "compaction",
+              estimatedTokensBefore: estimateInputTokens(previous, fixedInputTokens),
+              estimatedTokensAfter: estimateInputTokens(restored, fixedInputTokens),
+            }));
+          }
+          // 仅重试尚未取得回复的主请求；工具执行位于下方，不会重复执行。
         }
       }
 
@@ -476,6 +497,7 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
       addUsage(response.usage);
 
       await appendMessage({ role: "assistant", content: response.content });
+      contextUsage = anchorContextUsage(messages, fixedInputTokens, response.usage);
 
       lastText = response.content
         .filter((b): b is Anthropic.Beta.Messages.BetaTextBlock => b.type === "text")
@@ -812,6 +834,9 @@ function buildModelRequest(options: ModelRequestOptions): BetaStreamParams {
       request.betas = ["thinking-binding-controls-2026-08-01"];
     }
   }
+  if (messages.some((message) => message.role === "system" && message.clear_at !== undefined)) {
+    (request.betas ??= []).push("mid-conversation-system-clear-at-2026-08-21");
+  }
   return request;
 }
 
@@ -854,6 +879,12 @@ type Message = Anthropic.Beta.Messages.BetaMessageParam;
 /** SDK 返回的单次完整模型响应的 Token 用量。 */
 type Usage = Anthropic.Beta.Messages.BetaUsage;
 
+/** 最近一次完整主响应覆盖的消息前缀及其用量校准比例；仅在本次运行内有效。 */
+interface ContextUsageAnchor {
+  messageCount: number;
+  tokenScale: number;
+}
+
 /** 内部压缩入参；预算检查和摘要生成使用当前运行的配置，不保存跨调用状态。 */
 interface CompactMessagesOptions {
   /** 与主请求共用的 SDK 客户端。 */
@@ -862,18 +893,16 @@ interface CompactMessagesOptions {
   model: string;
   /** 当前有效上下文；压缩过程不就地修改消息或内容块。 */
   messages: readonly Message[];
-  /** 主请求的系统提示，用于估算固定输入开销。 */
-  systemPrompt: string;
-  /** 主请求的工具声明，仅参与预算估算，不传给摘要模型执行。 */
-  tools: readonly Anthropic.Beta.Messages.BetaTool[];
+  /** 主请求系统提示与工具声明的固定输入估值；摘要请求不携带这些内容。 */
+  fixedInputTokens: number;
+  /** 最近成功主请求的前缀校准；新增工具结果和注入消息单独估算。 */
+  contextUsage?: ContextUsageAnchor;
   /** 为主请求预留的输出 Token 上限。 */
   maxTokens: number;
   /** 模型输入与输出合计可使用的上下文窗口。 */
   contextWindow: number;
   /** 主请求明确超窗后的内部恢复开关；即使估算未超预算，也要求进一步缩小上下文。 */
   force?: boolean;
-  /** 用于判断当前工具回合的思考签名是否允许前缀变化，不传给摘要请求。 */
-  thinking?: Anthropic.Beta.Messages.BetaThinkingConfigParam;
   /** 取消预算处理及摘要请求的信号。 */
   signal?: AbortSignal;
   /** 收到完整摘要响应后累计用量；后续校验失败也保留已取得的用量。 */
@@ -926,6 +955,29 @@ function estimateMessage(message: Message): number {
   return estimateContent(message.content) + 8;
 }
 
+/** 临时纯文本 system 在下一条 user（包括工具结果）后失效；带配置或工具变更的消息保守保留。 */
+function isExpiredSystem(message: Message, index: number, lastUserIndex: number): boolean {
+  return message.role === "system" && message.clear_at === "next_user_message" && index < lastUserIndex &&
+    !message.output_config && (typeof message.content === "string" || (
+      Array.isArray(message.content) && message.content.every((block) => block.type === "text" && !block.cache_control)
+    ));
+}
+
+/** 估算当前模型可见的完整输入；失效的临时 system 仍留在请求中，但不计正文 Token。 */
+function estimateInputTokens(messages: readonly Message[], fixedInputTokens: number): number {
+  const lastUserIndex = messages.reduce((last, message, index) => message.role === "user" ? index : last, -1);
+  return fixedInputTokens + messages.reduce((sum, message, index) =>
+    sum + (isExpiredSystem(message, index, lastUserIndex) ? 0 : estimateMessage(message)), 0);
+}
+
+/** 用本次主请求的输入（含缓存）与输出校准已有前缀；零用量响应退回本地估算。 */
+function anchorContextUsage(messages: readonly Message[], fixedInputTokens: number, usage: Usage): ContextUsageAnchor | undefined {
+  const tokens = usage.input_tokens + usage.output_tokens +
+    (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0);
+  if (!Number.isFinite(tokens) || tokens <= 0) return undefined;
+  return { messageCount: messages.length, tokenScale: tokens / estimateInputTokens(messages, fixedInputTokens) };
+}
+
 /** 检测明文或隐藏的思考块，供前缀变化保护与旧签名清理使用。 */
 function hasThinking(message: Message): boolean {
   return Array.isArray(message.content) && message.content.some(
@@ -933,11 +985,19 @@ function hasThinking(message: Message): boolean {
   );
 }
 
-/** 移除已完成回合的思考块，避免前缀变化后复用旧签名；仅含思考的消息返回 null，当前工具回合由调用处排除。 */
+/** 移除思考块而保留其他内容；仅含思考的消息返回 null，调用处负责保护当前工具回合及 system 位置。 */
 function withoutThinking(message: Message): Message | null {
   if (!hasThinking(message) || !Array.isArray(message.content)) return message;
   const content = message.content.filter((block) => block.type !== "thinking" && block.type !== "redacted_thinking");
   return content.length > 0 ? { ...message, content } as Message : null;
+}
+
+/** 删空思考回合不能使中间 system 变成首条，或新产生 system 后紧接 user 的非法位置。 */
+function hasBrokenSystemPlacement(before: readonly Message[], after: readonly Message[]): boolean {
+  return after.some((message, index) => message.role === "system" && (
+    (index === 0 && before[0]?.role !== "system") ||
+    (after[index + 1]?.role === "user" && before[before.indexOf(message) + 1]?.role !== "user")
+  ));
 }
 
 /**
@@ -983,25 +1043,34 @@ function takeFragment(text: string, start: number, budget: number): string {
  * 不改写输入、不发送观察事件；全部历史片段处理完成且候选通过预算检查后返回，由调用方校验并采用。
  */
 async function compactMessages(options: CompactMessagesOptions): Promise<CompactedMessages | null> {
-  const { client, model, messages, systemPrompt, tools, maxTokens, contextWindow, force = false, thinking, signal, onUsage } = options;
+  const { client, model, messages, fixedInputTokens, contextUsage, maxTokens, contextWindow, force = false, signal, onUsage } = options;
   signal?.throwIfAborted();
 
   // 为估算误差预留余量，主请求的输出预算另行扣除。
   const safetyTokens = Math.min(8192, Math.ceil(contextWindow * 0.05));
   const normalInputBudget = contextWindow - maxTokens - safetyTokens;
-  const fixedTokens = estimateText(systemPrompt) + estimateText(JSON.stringify(tools)) + 16;
-  const messageTokens = messages.map(estimateMessage);
-  const estimatedTokensBefore = fixedTokens + messageTokens.reduce((sum, tokens) => sum + tokens, 0);
+  const lastUserIndex = messages.reduce((last, message, index) => message.role === "user" ? index : last, -1);
+  const tokenScale = contextUsage?.tokenScale ?? 1;
+  const fixedTokens = fixedInputTokens * tokenScale;
+  // 只校准最近主响应覆盖的前缀；新工具结果和新摘要不能套用旧比例。
+  const messageCost = (message: Message, index: number): number =>
+    isExpiredSystem(message, index, lastUserIndex) ? 0 :
+      estimateMessage(message) * (index < (contextUsage?.messageCount ?? 0) ? tokenScale : 1);
+  const messageTokens = messages.map(messageCost);
+  const estimatedTokensBefore = Math.ceil(fixedTokens + messageTokens.reduce((sum, tokens) => sum + tokens, 0));
   if (!force && estimatedTokensBefore <= normalInputBudget) return null;
   // 估算低估时也必须真正缩小请求，不能原样重复发送已经被服务端拒绝的上下文。
   const inputBudget = force ? Math.min(normalInputBudget, Math.floor(estimatedTokensBefore * 0.8)) : normalInputBudget;
 
   let leadingSystems = 0;
   while (messages[leadingSystems]?.role === "system") leadingSystems++;
-  const leading = messages.slice(0, leadingSystems);
-  const available = inputBudget - fixedTokens - messageTokens.slice(0, leadingSystems).reduce((sum, tokens) => sum + tokens, 0);
-  const summaryMaxTokens = Math.min(4096, Math.floor(available / 4));
-  if (summaryMaxTokens < 128) {
+  const leading = messages.slice(0, leadingSystems).filter((message, index) => !isExpiredSystem(message, index, lastUserIndex));
+  const leadingTokens = messageTokens.slice(0, leadingSystems).reduce((sum, tokens) => sum + tokens, 0);
+  const available = inputBudget - fixedTokens - leadingTokens;
+  // 主上下文只保留摘要正文；摘要模型自身还需要为推理输出留出空间。
+  const summaryTextBudget = Math.min(4096, Math.floor(available / 4));
+  const summaryOutputBudget = Math.min(16_384, maxTokens);
+  if (summaryTextBudget < 128) {
     throw new Error("上下文预算不足：系统提示词、工具定义与输出预留已占满窗口。请减少这些内容或 maxTokens。");
   }
 
@@ -1009,8 +1078,9 @@ async function compactMessages(options: CompactMessagesOptions): Promise<Compact
   const lastTurn = turns.at(-1);
   const lastAssistant = [...turns].reverse().find((turn) => turn.role === "assistant");
   const activeToolStart = lastAssistant?.toolUseIds.size ? lastAssistant.firstIndex : messages.length;
-  // 最新回合及尚在接续的工具回合保持原样。中间 system 消息只能留在原位，不能搬到摘要前重放。
-  const middleSystem = messages.findIndex((message, index) => index >= leadingSystems && message.role === "system");
+  // 仍有效的中间 system 留在原位；已失效的临时指令不限制切点，也不能写入摘要重新生效。
+  const middleSystem = messages.findIndex((message, index) =>
+    index >= leadingSystems && message.role === "system" && !isExpiredSystem(message, index, lastUserIndex));
   const protectedStart = Math.min(lastTurn?.firstIndex ?? 0, activeToolStart, middleSystem < 0 ? messages.length : middleSystem);
   // 切点必须位于回合边界，且不能留下失去调用前文的工具结果回合。
   const candidates = turns.filter((turn) =>
@@ -1021,48 +1091,43 @@ async function compactMessages(options: CompactMessagesOptions): Promise<Compact
     throw new Error("没有可安全压缩的旧回合：最新消息、当前工具回合或内联 system 消息必须保留。请缩小输入或工具输出。");
   }
 
-  // 当前工具回合含思考块时，只有宿主显式允许服务端丢弃不匹配块，才可改写其之前的上下文。
-  const allowsPrefixChange = thinking && "block_binding" in thinking &&
-    thinking.block_binding?.prefix_mismatch_behavior === "drop_block";
-  if (messages.slice(activeToolStart).some(hasThinking) && !allowsPrefixChange) {
-    throw new Error(
-      "当前工具回合含 thinking 签名，不能安全改写它之前的上下文。" +
-      "请仅在模型支持时显式配置 thinking.block_binding.prefix_mismatch_behavior='drop_block'，或缩小工具输出。",
-    );
-  }
-
-  const retained = messages.map((message, index) => index < activeToolStart ? withoutThinking(message) : message);
+  // 当前工具回合的思考原样回传，由服务端决定是否接受；明确的前缀错误由主请求恢复处理。
+  const retained = messages.map((message, index) => isExpiredSystem(message, index, lastUserIndex) ? null :
+    index < activeToolStart ? withoutThinking(message) : message);
   // 预先累计各切点之后的 Token，避免为每个候选切点重复扫描消息。
   const suffixTokens = new Array<number>(messages.length + 1).fill(0);
   for (let index = messages.length - 1; index >= 0; index--) {
-    suffixTokens[index] = suffixTokens[index + 1] + (retained[index] ? estimateMessage(retained[index]!) : 0);
+    suffixTokens[index] = suffixTokens[index + 1] + (retained[index] ? messageCost(retained[index]!, index) : 0);
   }
   const summaryOverhead = estimateText(SUMMARY_PREFIX) + 8;
   // 留出下一轮工具结果的空间，避免每轮都重写摘要。当前工具尾部可能使目标无法完全达到。
-  const target = Math.floor(available * 0.6) - summaryMaxTokens - summaryOverhead;
+  const target = Math.floor(available * 0.6) - summaryTextBudget - summaryOverhead;
   const cut = (candidates.find((turn) => suffixTokens[turn.firstIndex] <= target) ?? candidates.at(-1)!).firstIndex;
-  if (suffixTokens[cut] + summaryMaxTokens + summaryOverhead > available) {
+  if (suffixTokens[cut] + summaryTextBudget + summaryOverhead > available) {
     throw new Error("最新消息或当前工具回合过大，保留必要上下文后已无摘要空间。请缩小输入、工具输出或 maxTokens。");
   }
 
   const history = messages.slice(leadingSystems, cut)
+    .filter((message, index) => !isExpiredSystem(message, index + leadingSystems, lastUserIndex))
     .map((message) => `[${message.role}]\n${serializeContent(message.content)}`).join("\n\n");
+  const summarySystem = `${SUMMARY_SYSTEM}摘要正文控制在 ${summaryTextBudget} Token 以内，优先保留继续当前任务必需的信息。`;
+  const summaryInputBudget = Math.min(48_000, contextWindow - safetyTokens - summaryOutputBudget);
   let summary = "";
   let cursor = 0;
   // 每个片段严格前进，摘要输入和摘要输出单独计预算，不把已超限的完整历史再塞进一次摘要请求。
   while (cursor < history.length) {
     signal?.throwIfAborted();
     const header = summary ? `已有摘要：\n${summary}\n\n后续历史片段：\n` : "历史片段：\n";
-    const fragmentBudget = contextWindow - safetyTokens - summaryMaxTokens - estimateText(SUMMARY_SYSTEM) - estimateText(header) - 32;
+    const fragmentBudget = summaryInputBudget - estimateText(summarySystem) - estimateText(header) - 32;
     if (fragmentBudget < 64) throw new Error("摘要请求没有足够的输入空间。");
     const fragment = takeFragment(history, cursor, fragmentBudget);
     if (!fragment) throw new Error("无法在摘要预算内继续处理历史。");
-    const response = await client.beta.messages.create({
+    const response = await client.beta.messages.stream({
       model,
-      max_tokens: summaryMaxTokens,
-      system: SUMMARY_SYSTEM,
+      max_tokens: summaryOutputBudget,
+      system: summarySystem,
       messages: [{ role: "user", content: header + fragment }],
-    }, { signal });
+    }, { signal }).finalMessage();
     // 先累计完整响应的用量；随后取消或摘要校验失败也保留这部分记录。
     onUsage(response.usage);
     signal?.throwIfAborted();
@@ -1075,12 +1140,16 @@ async function compactMessages(options: CompactMessagesOptions): Promise<Compact
     cursor += fragment.length;
   }
 
+  const summaryMessage: Message = { role: "user", content: SUMMARY_PREFIX + summary };
   const nextMessages: Message[] = [
     ...leading,
-    { role: "user", content: SUMMARY_PREFIX + summary },
+    summaryMessage,
     ...retained.slice(cut).filter((message): message is Message => message !== null),
   ];
-  const estimatedTokensAfter = fixedTokens + nextMessages.reduce((sum, message) => sum + estimateMessage(message), 0);
+  if (hasBrokenSystemPlacement(messages, nextMessages)) {
+    throw new Error("压缩后无法保持内联 system 的合法位置，保留原上下文。持久指令请使用 systemPrompt。");
+  }
+  const estimatedTokensAfter = Math.ceil(fixedTokens + leadingTokens + estimateMessage(summaryMessage) + suffixTokens[cut]);
   if (estimatedTokensAfter > inputBudget || estimatedTokensAfter >= estimatedTokensBefore) {
     throw new Error("摘要未将上下文缩小到可用预算内，保留原上下文。请缩小输入、工具输出或 maxTokens。");
   }
@@ -1203,7 +1272,14 @@ function streamModelTurn(
 function isContextOverflow(error: unknown): boolean {
   return error instanceof Anthropic.APIError &&
     (error.status === 400 || error.status === 413) &&
-    /prompt is too long|context[_ ](?:length|window)[_ ]exceeded|maximum context length|exceeds? (?:the )?context window/i.test(error.message);
+    /prompt is too long|context[_ -](?:length|window)[_ -]exceeded|maximum context length|exceeds? (?:the )?(?:maximum )?context (?:length|window)|too many (?:input|prompt) tokens|(?:input|prompt) tokens? must be less than|(?:input|prompt) token count(?:\s*\([\d,]+\))?\s+exceeds?\s+(?:the\s+)?maximum/i.test(error.apiMessage ?? error.message);
+}
+
+/** 仅恢复服务端明确报告的前缀绑定失败；损坏签名、思考块保真校验及其他 400 不在此列。 */
+function isThinkingPrefixMismatch(error: unknown): boolean {
+  return error instanceof Anthropic.APIError && error.status === 400 &&
+    /Invalid [`']?signature[`']? in [`']?(?:redacted_)?thinking[`']? block\. The block is bound to a different conversation\./i
+      .test(error.apiMessage ?? error.message);
 }
 
 /**
