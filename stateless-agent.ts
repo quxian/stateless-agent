@@ -13,7 +13,9 @@ import { randomBytes } from "node:crypto";
  * 核心流程：按需压缩上下文 → 请求模型 → 串行执行工具 → 保存结果 → 继续或结束。
  *
  * 文件结构分层：
- * - 上半部分（第 1–3 节）：无状态 Agent 核心（公开类型契约、工具定义辅助、历史回合/缓存断点协议、上下文压缩、runAgent 主循环）。
+ * - 第 1 节：公开类型、运行错误与工具定义辅助。
+ * - 第 2 节：runAgent 主流程，按执行顺序阅读；上下文采用、主请求计数与停止原因在此决定。
+ * - 第 3 节：主流程调用的内部机制（请求装配、上下文压缩、流式响应与工具执行）。
  * - 下半部分（第 4–5 节）：内置本地工具实现（头尾缓冲区与受控进程组执行器、路径/图片/原子写/CRLF 编辑，以及独立导出的 createReadTool / createWriteTool / createEditTool / createBashTool）。
  *
  * 运行契约（宿主职责边界）：
@@ -211,8 +213,8 @@ export interface AgentOptions {
    */
   onMessage?: (message: Readonly<Anthropic.Beta.Messages.BetaMessageParam>) => void | Promise<void>;
   /**
-   * 观察侧事件回调：同步异常与异步拒绝均被隔离，不阻塞主流程返回
-   * （`runAgent` 返回时异步回调可能尚未完成，需要可靠投递的宿主应自行排队并等待处理完成）。
+   * 观察侧事件回调：同步异常与异步拒绝均被隔离，不等待异步回调完成。
+   * 同步回调仍在当前调用栈执行；`runAgent` 返回时异步回调可能尚未完成，需要可靠投递的宿主应自行排队并等待处理完成。
    */
   onEvent?: (event: AgentEvent) => void | Promise<void>;
   /**
@@ -313,7 +315,7 @@ export function defineTool<S extends z.ZodObject>(spec: {
 }
 
 // ============================================================================
-// 2. 历史回合恢复、请求副本与缓存断点、观察快照及上下文压缩
+// 2. runAgent：一次运行的主流程
 // ============================================================================
 
 /** 默认的最大模型请求轮次上限，防止工具调用陷入无限循环。 */
@@ -321,6 +323,241 @@ const DEFAULT_MAX_TURNS = 200;
 
 /** 默认输出上限的封顶值；实际默认值同时限制为上下文窗口的四分之一。 */
 const DEFAULT_MAX_TOKENS = 98_304;
+
+/**
+ * 执行一次无状态 Agent 运行；有效上下文从 options 传入，随正常结果或错误快照返回。
+ * 主流程按执行顺序展开：恢复历史 → 压缩并请求模型 → 记录回复 → 执行并记录工具 → 注入增量上下文。
+ *
+ * @returns 有效上下文、末条文本、停止原因、主模型请求次数与累计 Token 用量。
+ * @throws {Error} 运行参数不合法时直接抛出。
+ * @throws {AgentRunError} 运行中的非取消异常，附带发生时的上下文、请求次数与用量快照。
+ */
+export async function runAgent(options: AgentOptions): Promise<AgentResult> {
+  const {
+    client,
+    model,
+    signal,
+    contextWindow,
+    maxTokens = Math.min(DEFAULT_MAX_TOKENS, Math.floor(contextWindow / 4)),
+    maxTurns = DEFAULT_MAX_TURNS,
+    thinking,
+    getContextInjection,
+    onMessage,
+    onEvent,
+  } = options;
+
+  if (!Number.isInteger(maxTurns) || maxTurns < 1) {
+    throw new Error(`maxTurns 无效（${maxTurns}）：必须为正整数。`);
+  }
+  if (!Number.isSafeInteger(contextWindow) || contextWindow < 1) {
+    throw new Error("contextWindow 必须是模型上下文窗口的正整数 Token 上限。");
+  }
+  if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens >= contextWindow) {
+    throw new Error("maxTokens 必须是小于 contextWindow 的正整数。");
+  }
+  if (thinking?.type === "enabled" && thinking.budget_tokens >= maxTokens) {
+    throw new Error("thinking.budget_tokens 必须小于 maxTokens。");
+  }
+
+  let messages: Anthropic.Beta.Messages.BetaMessageParam[] = [...options.messages];
+  const tools = options.tools ?? [];
+  const toolMap = new Map<string, AgentTool>(tools.map((t) => [t.name, t]));
+  const toolNamesList = Array.from(toolMap.keys()).join(", ");
+
+  // 宿主显式配置工具缓存时，默认缓存策略整体让位；消息中的显式配置在每次请求时检查。
+  const allowDefaultCacheBreakpoints =
+    (options.autoCacheBreakpoints ?? true) && !tools.some((tool) => tool.cache_control);
+  const compactionTools = buildApiTools(tools);
+
+  const systemPrompt =
+    options.systemPrompt ??
+    (tools.length > 0
+      ? `你是一个乐于助人的助手，可以调用工具完成任务。可用工具：${toolNamesList}。`
+      : "你是一个乐于助人的助手。");
+
+  let lastText = "";
+  let stopReason: AgentStopReason = null;
+  let turns = 0; // 主模型请求次数，包含超窗后的重试，不包含摘要请求。
+  const usage: AgentUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
+  /** 累计主请求与摘要请求已取得完整响应的用量；后续校验失败也保留这部分用量。 */
+  const addUsage = (completed: Anthropic.Beta.Messages.BetaUsage) => {
+    usage.inputTokens += completed.input_tokens;
+    usage.outputTokens += completed.output_tokens;
+    usage.cacheReadTokens += completed.cache_read_input_tokens ?? 0;
+    usage.cacheCreationTokens += completed.cache_creation_input_tokens ?? 0;
+  };
+
+  /** 观察通知不等待异步回调；无订阅者时不构造事件，构造或回调异常均被隔离。 */
+  const emit: EmitEvent = (build) => {
+    if (!onEvent) return;
+    try {
+      Promise.resolve(onEvent(build())).catch(() => {});
+    } catch {}
+  };
+
+  /** 先追加真实消息，再等待宿主回调；回调失败时，错误快照仍包含这条消息。 */
+  const appendMessage = async (msg: Anthropic.Beta.Messages.BetaMessageParam) => {
+    messages.push(msg);
+    if (onMessage) {
+      await onMessage(msg);
+    }
+  };
+
+  try {
+    // 入口预取消检查：若调用前 signal 已取消，直接返回 aborted，不写入恢复消息
+    throwIfAborted(signal);
+
+    const trailingRecovery = buildTrailingRecoveryMessage(messages);
+    if (trailingRecovery) {
+      await appendMessage(trailingRecovery);
+    }
+
+    while (turns < maxTurns) {
+      throwIfAborted(signal);
+
+      // 取得本轮回复：首次请求按需压缩，仅明确超窗时再强制压缩并请求一次。
+      let response: Anthropic.Beta.Messages.BetaMessage;
+      for (let requestAttempt = 0; ; requestAttempt++) {
+        assertToolResultsPaired(messages);
+        const compacted = await compactMessages({
+          client,
+          model,
+          messages,
+          systemPrompt,
+          tools: compactionTools,
+          maxTokens,
+          contextWindow,
+          thinking,
+          signal,
+          onUsage: addUsage,
+          force: requestAttempt > 0,
+        }).catch((err) => {
+          throwIfAborted(signal);
+          throw err;
+        });
+        throwIfAborted(signal);
+
+        if (compacted) {
+          assertToolResultsPaired(compacted.messages);
+          messages = compacted.messages;
+          // 先采用上下文再通知；观察回调触发取消时，快照仍保留本次摘要。
+          emit(() => ({
+            type: "compaction",
+            estimatedTokensBefore: compacted.estimatedTokensBefore,
+            estimatedTokensAfter: compacted.estimatedTokensAfter,
+          }));
+        }
+        throwIfAborted(signal);
+
+        // 重试范围仅限主请求；摘要失败不会再次触发压缩重试。
+        try {
+          const request = buildModelRequest({
+            model,
+            messages,
+            tools,
+            systemPrompt,
+            maxTokens,
+            thinking,
+            allowDefaultCacheBreakpoints,
+          });
+          turns++;
+          response = await streamModelTurn(client, request, signal, Boolean(onEvent), emit).catch((err) => {
+            throwIfAborted(signal);
+            throw err;
+          });
+          break;
+        } catch (err) {
+          if (requestAttempt > 0 || !isContextOverflow(err) || turns >= maxTurns) throw err;
+          // 这里只重试尚未取得回复的主请求，工具执行位于下方，不会重复执行。
+        }
+      }
+
+      // 完整回复先记用量、追加消息，再处理停止原因；与取消同时到达的最终回复按完成处理。
+      addUsage(response.usage);
+
+      await appendMessage({ role: "assistant", content: response.content });
+
+      lastText = response.content
+        .filter((b): b is Anthropic.Beta.Messages.BetaTextBlock => b.type === "text")
+        .map((b) => b.text)
+        .join("\n");
+
+      stopReason = response.stop_reason;
+
+      const toolUseBlocks = response.content.filter(
+        (b): b is Anthropic.Beta.Messages.BetaToolUseBlock => b.type === "tool_use"
+      );
+
+      if (toolUseBlocks.length === 0) {
+        break;
+      }
+
+      // 非 tool_use 停止但响应已包含 tool_use 块时，必须补齐错误结果以维持历史配对：
+      // - max_tokens 截断：写入提示后继续进入下一轮，让模型有机会分批或缩小参数重试；
+      // - 其他停止原因（如 stop_sequence / refusal）：写入未执行说明后立即结束运行。
+      if (response.stop_reason !== "tool_use" && response.stop_reason !== "max_tokens") {
+        await appendMessage({
+          role: "user",
+          content: buildSkippedToolResults(
+            toolUseBlocks,
+            `模型生成因 '${response.stop_reason}' 停止，该工具调用未执行。`
+          ),
+        });
+        break;
+      }
+
+      let userContent: Anthropic.Beta.Messages.BetaContentBlockParam[];
+      if (response.stop_reason === "max_tokens") {
+        userContent = buildSkippedToolResults(
+          toolUseBlocks,
+          "工具调用因达到 max_tokens 输出上限而被截断，未执行。请减小单次工具调用的参数内容（如分批处理）后重试。"
+        );
+      } else {
+        userContent = await executeToolBatch(toolUseBlocks, {
+          toolMap,
+          toolNamesList,
+          signal,
+          hasEventSubscriber: Boolean(onEvent),
+          emit,
+        });
+      }
+
+      // 工具结果先追加并交给宿主，确保历史配对后再响应取消。
+      await appendMessage({ role: "user", content: userContent });
+      throwIfAborted(signal);
+
+      // 工具批次完成后读取增量上下文；非取消错误交回调用方，避免遗漏关键控制指令。
+      if (getContextInjection) {
+        const injected = await runAbortable(() => getContextInjection({ signal }), signal);
+        if (injected) {
+          await appendMessage({
+            role: "user",
+            content: [{ type: "text", text: injected }],
+          });
+        }
+      }
+
+      // 若在保存注入消息期间触发了取消，优先报告 aborted 而非 max_turns
+      throwIfAborted(signal);
+
+      if (turns >= maxTurns) {
+        stopReason = "max_turns";
+      }
+    }
+
+    return { messages, lastText, stopReason, turns, usage };
+  } catch (err: unknown) {
+    if (err instanceof RunAborted) {
+      return { messages, lastText, stopReason: "aborted", turns, usage };
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    throw new AgentRunError(message, { messages, turns, usage }, { cause: err });
+  }
+}
+
+// ============================================================================
+// 3. 内部机制：消息回合、请求装配、上下文压缩、流式响应与工具执行
+// ============================================================================
 
 /** `tool_end` 观察事件中 `outputSummary` 字段的最大字符数上限。 */
 const TOOL_SUMMARY_MAX_CHARS = 500;
@@ -518,6 +755,64 @@ function buildApiRequestMessages(
   }
 
   return normalized;
+}
+
+/** Anthropic Beta Messages 流式请求入参类型。 */
+type BetaStreamParams = Parameters<Anthropic["beta"]["messages"]["stream"]>[0];
+
+/** 只用于构造请求的输入；不包含运行次数、用量或观察回调。 */
+interface ModelRequestOptions {
+  model: string;
+  messages: Anthropic.Beta.Messages.BetaMessageParam[];
+  tools: readonly AgentTool[];
+  systemPrompt: string;
+  maxTokens: number;
+  thinking?: Anthropic.Beta.Messages.BetaThinkingConfigParam;
+  /** 宿主允许默认缓存且工具未显式配置缓存；消息中的配置仍需逐次检查。 */
+  allowDefaultCacheBreakpoints: boolean;
+}
+
+/** 从本地工具中提取 API 声明；显式缓存配置优先，默认断点只放在末尾工具。 */
+function buildApiTools(tools: readonly AgentTool[], addDefaultBreakpoint = false): Anthropic.Beta.Messages.BetaTool[] {
+  return tools.map((tool, index) => {
+    const declaration: Anthropic.Beta.Messages.BetaTool = {
+      name: tool.name,
+      description: tool.description,
+      input_schema: tool.input_schema,
+    };
+    if (tool.cache_control) {
+      declaration.cache_control = tool.cache_control;
+    } else if (addDefaultBreakpoint && index === tools.length - 1) {
+      declaration.cache_control = { type: "ephemeral" };
+    }
+    return declaration;
+  });
+}
+
+/** 构造单次主请求的参数副本，集中处理缓存与 SDK 字段；不修改运行状态，也不发起请求。 */
+function buildModelRequest(options: ModelRequestOptions): BetaStreamParams {
+  const { model, messages, tools, systemPrompt, maxTokens, thinking, allowDefaultCacheBreakpoints } = options;
+  const addCacheBreakpoints = allowDefaultCacheBreakpoints && !messagesHaveCacheControl(messages);
+  const apiTools = buildApiTools(tools, addCacheBreakpoints);
+  const apiMessages = buildApiRequestMessages(messages, addCacheBreakpoints);
+  const request: BetaStreamParams = {
+    model,
+    max_tokens: maxTokens,
+    system: systemPrompt,
+    messages: apiMessages,
+  };
+
+  if (addCacheBreakpoints) {
+    request.system = [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }];
+  }
+  if (apiTools.length > 0) request.tools = apiTools;
+  if (thinking) {
+    request.thinking = thinking;
+    if ("block_binding" in thinking && thinking.block_binding) {
+      request.betas = ["thinking-binding-controls-2026-08-01"];
+    }
+  }
+  return request;
 }
 
 /**
@@ -793,12 +1088,13 @@ async function compactMessages(options: CompactMessagesOptions): Promise<Compact
   return { messages: nextMessages, estimatedTokensBefore, estimatedTokensAfter };
 }
 
-// ============================================================================
-// 3. 核心 Agent 执行函数（流式请求、串行工具执行与主循环）
-// ============================================================================
-
 /** `runAgent` 主循环内部专用取消控制流信令，用于将各阶段的取消检查统一收敛至外层出口。 */
 class RunAborted {}
+
+/** 在明确的取消检查点退出主流程；调用方选择检查时机，保证已产生的结果先被记录。 */
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new RunAborted();
+}
 
 /**
  * 在取消信号保护下执行宿主钩子：启动前、等待期间、返回时或抛错后若信号已触发，统一抛出 `RunAborted` 并清理监听。
@@ -836,9 +1132,6 @@ async function runAbortable<T>(fn: () => Promise<T> | T, signal?: AbortSignal): 
 
 /** 惰性观察事件发射器：仅在存在 `onEvent` 订阅者时才调用工厂函数构造事件，避免无订阅者时产生深拷贝或摘要开销。 */
 type EmitEvent = (build: () => AgentEvent) => void;
-
-/** Anthropic Beta Messages 流式请求入参类型别名。 */
-type BetaStreamParams = Parameters<Anthropic["beta"]["messages"]["stream"]>[0];
 
 /** 单轮工具调用批次串行执行所需的共享运行上下文。 */
 interface ToolBatchExecutionContext {
@@ -1013,278 +1306,6 @@ async function executeToolBatch(
     results.push(await executeSingleToolBlock(block, ctx));
   }
   return results;
-}
-
-/**
- * 执行无状态的“模型推理 ↔ 工具调用”核心主循环：
- * 1. 校验运行参数、检查入口取消状态，并为上次中断遗留的末尾未配对 `tool_use` 补齐恢复结果；
- * 2. 每轮依次执行：按需摘要并采用有效上下文 → 自动缓存断点装配 → 流式请求模型 → 累计用量并持久化真实 `assistant` 消息；
- * 3. 若响应不含 `tool_use` 则结束；若含 `tool_use` 则按停止原因处理截断或串行执行工具批次，持久化 `tool_result`，并按需调用 `getContextInjection` 注入增量指令；
- * 4. 正常结束、取消或达到 `maxTurns` 时返回 `AgentResult`；其他未预期异常统一包装为携带最新状态快照的 `AgentRunError` 抛出。
- *
- * @param options 本次 Agent 运行的完整配置项（客户端、模型、消息历史、工具集与生命周期钩子）。
- * @returns 包含有效上下文、末条文本、停止原因、主模型请求轮次与累计 Token 用量的 `AgentResult`。
- * @throws {Error} 当轮次、上下文窗口或输出预算不合法时直接抛出。
- * @throws {AgentRunError} 当运行期间模型请求、消息校验或宿主钩子发生非取消异常时抛出（附带状态快照）。
- */
-export async function runAgent(options: AgentOptions): Promise<AgentResult> {
-  const {
-    client,
-    model,
-    signal,
-    contextWindow,
-    maxTokens = Math.min(DEFAULT_MAX_TOKENS, Math.floor(contextWindow / 4)),
-    maxTurns = DEFAULT_MAX_TURNS,
-    thinking,
-    getContextInjection,
-    onMessage,
-    onEvent,
-  } = options;
-
-  if (!Number.isInteger(maxTurns) || maxTurns < 1) {
-    throw new Error(`maxTurns 无效（${maxTurns}）：必须为正整数。`);
-  }
-  if (!Number.isSafeInteger(contextWindow) || contextWindow < 1) {
-    throw new Error("contextWindow 必须是模型上下文窗口的正整数 Token 上限。");
-  }
-  if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens >= contextWindow) {
-    throw new Error("maxTokens 必须是小于 contextWindow 的正整数。");
-  }
-  if (thinking?.type === "enabled" && thinking.budget_tokens >= maxTokens) {
-    throw new Error("thinking.budget_tokens 必须小于 maxTokens。");
-  }
-
-  let messages: Anthropic.Beta.Messages.BetaMessageParam[] = [...options.messages];
-  const tools = options.tools ?? [];
-  const toolMap = new Map<string, AgentTool>(tools.map((t) => [t.name, t]));
-  const toolNamesList = Array.from(toolMap.keys()).join(", ");
-
-  // 自动缓存断点按每次请求的最终消息判断：调用方在 tools 或本次发送的消息中显式设置了 cache_control 时沿用其配置
-  const autoCacheBreakpoints = options.autoCacheBreakpoints ?? true;
-  const toolsHaveCacheControl = tools.some((t) => t.cache_control);
-
-  /** 根据本轮是否启用默认缓存断点，构造发往 API 的工具声明数组（默认断点标记在末尾工具上）。 */
-  const buildApiTools = (addDefaultBreakpoint: boolean): Anthropic.Beta.Messages.BetaTool[] =>
-    tools.map((t, idx) => ({
-      name: t.name,
-      description: t.description,
-      input_schema: t.input_schema,
-      ...(t.cache_control
-        ? { cache_control: t.cache_control }
-        : addDefaultBreakpoint && idx === tools.length - 1
-          ? { cache_control: { type: "ephemeral" as const } }
-          : {}),
-    }));
-  // 仅用于估算主请求的工具声明开销；摘要请求不携带可执行工具。
-  const compactionTools = buildApiTools(false);
-
-  const systemPrompt =
-    options.systemPrompt ??
-    (tools.length > 0
-      ? `你是一个乐于助人的助手，可以调用工具完成任务。可用工具：${toolNamesList}。`
-      : "你是一个乐于助人的助手。");
-
-  let lastText = "";
-  let stopReason: AgentStopReason = null;
-  let turns = 0;
-  const usage: AgentUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
-  /** 累计主请求与摘要请求已取得完整响应的用量；后续校验失败也保留这部分用量。 */
-  const addUsage = (completed: Anthropic.Beta.Messages.BetaUsage) => {
-    usage.inputTokens += completed.input_tokens;
-    usage.outputTokens += completed.output_tokens;
-    usage.cacheReadTokens += completed.cache_read_input_tokens ?? 0;
-    usage.cacheCreationTokens += completed.cache_creation_input_tokens ?? 0;
-  };
-
-  /** 观察事件发射器：仅在有订阅者时才构造事件（含复制输入、生成摘要）；构造或回调中的同步异常与异步拒绝均被隔离。 */
-  const emit: EmitEvent = (build) => {
-    if (!onEvent) return;
-    try {
-      Promise.resolve(onEvent(build())).catch(() => {});
-    } catch {}
-  };
-
-  /** 真实新增消息追加到有效上下文，并等待 `onMessage` 保存；摘要替换不经过这里。 */
-  const appendMessage = async (msg: Anthropic.Beta.Messages.BetaMessageParam) => {
-    messages.push(msg);
-    if (onMessage) {
-      await onMessage(msg);
-    }
-  };
-
-  /** 若取消信号已触发，立即抛出内部 `RunAborted` 信令跳转至统一取消出口。 */
-  const throwIfAborted = () => {
-    if (signal?.aborted) throw new RunAborted();
-  };
-
-  /** 校验并按需压缩当前上下文；新上下文通过配对校验后才采用，并发送观察事件，不触发 onMessage。 */
-  const compactContext = async (force = false) => {
-    assertToolResultsPaired(messages);
-    const compacted = await compactMessages({
-      client,
-      model,
-      messages,
-      systemPrompt,
-      tools: compactionTools,
-      maxTokens,
-      contextWindow,
-      thinking,
-      signal,
-      onUsage: addUsage,
-      force,
-    }).catch((err) => {
-      throwIfAborted();
-      throw err;
-    });
-    throwIfAborted();
-    if (compacted) {
-      assertToolResultsPaired(compacted.messages);
-      messages = compacted.messages;
-      // 观察回调即使触发取消，返回快照仍保留本次已采用的上下文。
-      emit(() => ({
-        type: "compaction",
-        estimatedTokensBefore: compacted.estimatedTokensBefore,
-        estimatedTokensAfter: compacted.estimatedTokensAfter,
-      }));
-    }
-    throwIfAborted();
-  };
-
-  /** 按有效上下文构造请求副本与缓存断点；每次模型请求都计入主轮次，包括超窗后的重试。 */
-  const requestModel = () => {
-    const addDefaultCacheBreakpoints =
-      autoCacheBreakpoints && !toolsHaveCacheControl && !messagesHaveCacheControl(messages);
-    const apiTools = buildApiTools(addDefaultCacheBreakpoints);
-    const apiMessages = buildApiRequestMessages(messages, addDefaultCacheBreakpoints);
-    turns++;
-
-    return streamModelTurn(
-      client,
-      {
-        model,
-        max_tokens: maxTokens,
-        system: addDefaultCacheBreakpoints
-          ? [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }]
-          : systemPrompt,
-        ...(apiTools.length > 0 ? { tools: apiTools } : {}),
-        messages: apiMessages,
-        ...(thinking ? { thinking } : {}),
-        ...(thinking && "block_binding" in thinking && thinking.block_binding
-          ? { betas: ["thinking-binding-controls-2026-08-01"] }
-          : {}),
-      },
-      signal,
-      Boolean(onEvent),
-      emit
-    ).catch((err) => {
-      throwIfAborted();
-      throw err;
-    });
-  };
-
-  try {
-    // 入口预取消检查：若调用前 signal 已取消，直接返回 aborted，不写入恢复消息
-    throwIfAborted();
-
-    const trailingRecovery = buildTrailingRecoveryMessage(messages);
-    if (trailingRecovery) {
-      await appendMessage(trailingRecovery);
-    }
-
-    while (turns < maxTurns) {
-      throwIfAborted();
-      await compactContext();
-
-      let response: Anthropic.Beta.Messages.BetaMessage;
-      try {
-        response = await requestModel();
-      } catch (err) {
-        if (!isContextOverflow(err) || turns >= maxTurns) throw err;
-        // 本次主请求最多强制压缩并重试一次，重试失败直接向外抛出。
-        // 恢复发生在记录响应和执行工具之前，不会重复执行工具。
-        await compactContext(true);
-        response = await requestModel();
-      }
-
-      addUsage(response.usage);
-
-      // 注意：此处不检查取消——若最终回复（无 tool_use）已完整到达，即使与取消同时发生也以完成为准
-      await appendMessage({ role: "assistant", content: response.content });
-
-      lastText = response.content
-        .filter((b): b is Anthropic.Beta.Messages.BetaTextBlock => b.type === "text")
-        .map((b) => b.text)
-        .join("\n");
-
-      stopReason = response.stop_reason;
-
-      const toolUseBlocks = response.content.filter(
-        (b): b is Anthropic.Beta.Messages.BetaToolUseBlock => b.type === "tool_use"
-      );
-
-      if (toolUseBlocks.length === 0) {
-        break;
-      }
-
-      // 非 tool_use 停止但响应已包含 tool_use 块时，必须补齐错误结果以维持历史配对：
-      // - max_tokens 截断：写入提示后继续进入下一轮，让模型有机会分批或缩小参数重试；
-      // - 其他停止原因（如 stop_sequence / refusal）：写入未执行说明后立即结束运行。
-      if (response.stop_reason !== "tool_use" && response.stop_reason !== "max_tokens") {
-        await appendMessage({
-          role: "user",
-          content: buildSkippedToolResults(
-            toolUseBlocks,
-            `模型生成因 '${response.stop_reason}' 停止，该工具调用未执行。`
-          ),
-        });
-        break;
-      }
-
-      const userContent: Anthropic.Beta.Messages.BetaContentBlockParam[] =
-        response.stop_reason === "max_tokens"
-          ? buildSkippedToolResults(
-              toolUseBlocks,
-              "工具调用因达到 max_tokens 输出上限而被截断，未执行。请减小单次工具调用的参数内容（如分批处理）后重试。"
-            )
-          : await executeToolBatch(toolUseBlocks, {
-              toolMap,
-              toolNamesList,
-              signal,
-              hasEventSubscriber: Boolean(onEvent),
-              emit,
-            });
-
-      // 1. 先记录并持久化本轮工具结果（或 max_tokens 截断未执行结果），确保历史配对后再响应取消
-      await appendMessage({ role: "user", content: userContent });
-      throwIfAborted();
-
-      // 2. 获取增量上下文（若钩子抛错且非取消，向上抛出以避免遗漏关键控制指令）
-      if (getContextInjection) {
-        const injected = await runAbortable(() => getContextInjection({ signal }), signal);
-        if (injected) {
-          await appendMessage({
-            role: "user",
-            content: [{ type: "text", text: injected }],
-          });
-        }
-      }
-
-      // 若在保存注入消息期间触发了取消，优先报告 aborted 而非 max_turns
-      throwIfAborted();
-
-      if (turns >= maxTurns) {
-        stopReason = "max_turns";
-      }
-    }
-
-    return { messages, lastText, stopReason, turns, usage };
-  } catch (err: unknown) {
-    if (err instanceof RunAborted) {
-      return { messages, lastText, stopReason: "aborted", turns, usage };
-    }
-    const message = err instanceof Error ? err.message : String(err);
-    throw new AgentRunError(message, { messages, turns, usage }, { cause: err });
-  }
 }
 
 // ============================================================================
