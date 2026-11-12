@@ -82,6 +82,6 @@ try {
 
 内置工具可按需装配：`createReadTool`、`createWriteTool`、`createEditTool`、`createBashTool`；自定义工具使用 `defineTool`。工具在单次运行中串行执行，Bash 工具需要 POSIX 环境。
 
-公开入口及主循环在 `stateless-agent.ts`，压缩在 `compact-messages.ts`，回合边界在 `message-turns.ts`。
+Agent 主循环、上下文压缩与内置工具始终保留在 `stateless-agent.ts` 单文件中。仓库不提交测试文件。
 
-`npm test` 运行 `test.ts` 中的真实模型示例，会访问配置的模型服务并执行工具；`npm run typecheck` 仅做类型检查。
+`npm run example` 运行 `example.ts` 中的真实模型示例，会访问配置的模型服务并执行工具；`npm run typecheck` 仅做类型检查。

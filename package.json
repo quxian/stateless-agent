@@ -6,7 +6,7 @@
     "node": ">=24"
   },
   "scripts": {
-    "test": "tsx test.ts",
+    "example": "tsx example.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
