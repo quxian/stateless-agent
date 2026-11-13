@@ -161,14 +161,17 @@ export function defineTool<S extends z.ZodObject>(spec: {
     context: AgentToolContext
   ) => Promise<ToolOutput | AgentToolResult> | ToolOutput | AgentToolResult;
 }): AgentTool<z.infer<S>> {
-  return {
+  const tool: AgentTool<z.infer<S>> = {
     name: spec.name,
     description: spec.description,
     input_schema: z.toJSONSchema(spec.inputSchema, { reused: "ref" }) as AgentTool["input_schema"],
-    ...(spec.cache_control ? { cache_control: spec.cache_control } : {}),
     parse: (input) => spec.inputSchema.parse(input),
     run: spec.run,
   };
+  if (spec.cache_control) {
+    tool.cache_control = spec.cache_control;
+  }
+  return tool;
 }
 
 // ============================================================================
@@ -217,17 +220,27 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
   const toolNamesList = Array.from(toolMap.keys()).join(", ");
   const allowDefaultCacheBreakpoints =
     (options.autoCacheBreakpoints ?? true) && !tools.some((t) => t.cache_control);
-  const systemPrompt =
-    options.systemPrompt ??
-    (tools.length > 0
-      ? `你是一个乐于助人的助手，可以调用工具完成任务。可用工具：${toolNamesList}。`
-      : "你是一个乐于助人的助手。");
+  let defaultPrompt = "你是一个乐于助人的助手。";
+  if (tools.length > 0) {
+    defaultPrompt = `你是一个乐于助人的助手，可以调用工具完成任务。可用工具：${toolNamesList}。`;
+  }
+  const systemPrompt = options.systemPrompt ?? defaultPrompt;
 
   let lastText = "";
   let stopReason: AgentStopReason = null;
   let turns = 0;
   let contextUsage: ContextUsageAnchor | undefined;
+  let persisting = false;
   const usage: AgentUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
+
+  // 启动前若已取消，直接返回，不写入恢复消息
+  if (signal?.aborted) {
+    return { messages, lastText, stopReason: "aborted", turns, usage };
+  }
+
+  const fixedInputTokens = estimateText(systemPrompt) + estimateText(JSON.stringify(buildApiTools(tools))) + 16;
+
+  // --- 本次运行的局部有状态操作 ---
 
   const addUsage = (u: Usage) => {
     usage.inputTokens += u.input_tokens;
@@ -237,7 +250,6 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
   };
   const emit = (event: AgentEvent) => emitEvent(onEvent, event);
 
-  let persisting = false;
   const appendMessage = async (msg: Message) => {
     messages.push(msg);
     if (!onMessage) return;
@@ -247,10 +259,81 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
     persisting = false;
   };
 
-  // 启动前若已取消，直接返回，不写入恢复消息
-  if (signal?.aborted) {
-    return { messages, lastText, stopReason: "aborted", turns, usage };
-  }
+  const compactIfNeeded = async (force = false) => {
+    const compacted = await compactMessages({
+      client,
+      model,
+      messages,
+      fixedInputTokens,
+      contextUsage,
+      maxTokens,
+      contextWindow,
+      force,
+      signal,
+      onUsage: addUsage,
+    });
+    if (!compacted || signal?.aborted) return;
+    assertToolResultsPaired(compacted.messages);
+    messages = compacted.messages;
+    contextUsage = undefined;
+    emit({
+      type: "compaction",
+      estimatedTokensBefore: compacted.estimatedTokensBefore,
+      estimatedTokensAfter: compacted.estimatedTokensAfter,
+    });
+  };
+
+  /** 发起单轮流式模型请求；遇输入超窗或 thinking 签名失配时，各最多原地恢复重试一次。恢复期间若取消则返回 undefined。 */
+  const requestWithRecovery = async (): Promise<Anthropic.Beta.Messages.BetaMessage | undefined> => {
+    let retriedOverflow = false;
+    let retriedThinking = false;
+
+    while (true) {
+      const request = buildModelRequest({
+        model,
+        messages,
+        tools,
+        systemPrompt,
+        maxTokens,
+        thinking,
+        allowDefaultCacheBreakpoints,
+      });
+      turns++;
+
+      try {
+        return await streamModelResponse(client, request, signal, onEvent);
+      } catch (err) {
+        if (signal?.aborted || turns >= maxTurns) throw err;
+
+        // 恢复分支 A：本地估算低估导致服务端报输入超窗 → 强制压缩后重试主请求
+        if (!retriedOverflow && isContextOverflow(err)) {
+          retriedOverflow = true;
+          await compactIfNeeded(true);
+          if (signal?.aborted) return undefined;
+          continue;
+        }
+
+        // 恢复分支 B：前缀变化导致旧 thinking 签名被服务端拒绝（非手动 enabled 模式）→ 剥离 thinking 块后重试
+        if (!retriedThinking && thinking?.type !== "enabled" && isThinkingPrefixMismatch(err)) {
+          retriedThinking = true;
+          const stripped = stripThinkingMessages(messages);
+          if (!stripped) throw err;
+          const beforeTokens = estimateInputTokens(messages, fixedInputTokens);
+          messages = stripped;
+          contextUsage = undefined;
+          emit({
+            type: "compaction",
+            estimatedTokensBefore: beforeTokens,
+            estimatedTokensAfter: estimateInputTokens(messages, fixedInputTokens),
+          });
+          if (signal?.aborted) return undefined;
+          continue;
+        }
+
+        throw err;
+      }
+    }
+  };
 
   try {
     // 2. 恢复末尾悬空的工具调用：若上次运行在 assistant 发出 tool_use 后中断，补齐错误结果使对话可继续
@@ -261,32 +344,6 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
         content: Array.from(lastInitialTurn.toolUseIds, (id) => errorToolResult(id, RECOVERY_RESULT_TEXT)),
       });
     }
-
-    const fixedInputTokens = estimateText(systemPrompt) + estimateText(JSON.stringify(buildApiTools(tools))) + 16;
-
-    const compactIfNeeded = async (force = false) => {
-      const compacted = await compactMessages({
-        client,
-        model,
-        messages,
-        fixedInputTokens,
-        contextUsage,
-        maxTokens,
-        contextWindow,
-        force,
-        signal,
-        onUsage: addUsage,
-      });
-      if (!compacted || signal?.aborted) return;
-      assertToolResultsPaired(compacted.messages);
-      messages = compacted.messages;
-      contextUsage = undefined;
-      emit({
-        type: "compaction",
-        estimatedTokensBefore: compacted.estimatedTokensBefore,
-        estimatedTokensAfter: compacted.estimatedTokensAfter,
-      });
-    };
 
     // 3. 主模型—工具循环
     while (turns < maxTurns) {
@@ -303,57 +360,8 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
         break;
       }
 
-      // 3.2 发起流式模型请求；明确超窗或 thinking 签名绑定不匹配时，各最多自动恢复重试一次
-      let response: Anthropic.Beta.Messages.BetaMessage | undefined;
-      let retriedOverflow = false;
-      let retriedThinking = false;
-
-      while (!response) {
-        const request = buildModelRequest({
-          model,
-          messages,
-          tools,
-          systemPrompt,
-          maxTokens,
-          thinking,
-          allowDefaultCacheBreakpoints,
-        });
-        turns++;
-
-        try {
-          response = await streamModelResponse(client, request, signal, onEvent);
-        } catch (err) {
-          if (signal?.aborted || turns >= maxTurns) throw err;
-
-          // 恢复分支 A：本地估算低估导致服务端报输入超窗 → 强制压缩后重试主请求
-          if (!retriedOverflow && isContextOverflow(err)) {
-            retriedOverflow = true;
-            await compactIfNeeded(true);
-            if (signal?.aborted) break;
-            continue;
-          }
-
-          // 恢复分支 B：前缀变化导致旧 thinking 签名被服务端拒绝（非手动 enabled 模式）→ 剥离 thinking 块后重试
-          if (!retriedThinking && thinking?.type !== "enabled" && isThinkingPrefixMismatch(err)) {
-            retriedThinking = true;
-            const stripped = stripThinkingMessages(messages);
-            if (!stripped) throw err;
-            const beforeTokens = estimateInputTokens(messages, fixedInputTokens);
-            messages = stripped;
-            contextUsage = undefined;
-            emit({
-              type: "compaction",
-              estimatedTokensBefore: beforeTokens,
-              estimatedTokensAfter: estimateInputTokens(messages, fixedInputTokens),
-            });
-            if (signal?.aborted) break;
-            continue;
-          }
-
-          throw err;
-        }
-      }
-
+      // 3.2 发起流式模型请求（含超窗与 thinking 签名失配的有限自动恢复）
+      const response = await requestWithRecovery();
       if (!response) {
         stopReason = "aborted";
         break;
@@ -438,7 +446,8 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
     if (!persisting && signal?.aborted) {
       return { messages, lastText, stopReason: "aborted", turns, usage };
     }
-    const message = err instanceof Error ? err.message : String(err);
+    let message = String(err);
+    if (err instanceof Error) message = err.message;
     throw new AgentRunError(message, { messages, turns, usage }, { cause: err });
   }
 }
@@ -496,9 +505,8 @@ function assertToolResultsPaired(messages: readonly Message[]): void {
   for (let t = 0; t < turns.length; t++) {
     if (turns[t].role !== "user") continue;
     const prev = turns[t - 1];
-    const known = prev?.role === "assistant" ? prev.toolUseIds : undefined;
     for (const id of turns[t].toolResultIds) {
-      if (!known?.has(id)) {
+      if (prev?.role !== "assistant" || !prev.toolUseIds.has(id)) {
         throw new Error(
           `请求消息中包含 tool_use_id 为 '${id}' 的 tool_result，但紧邻其前缺少包含对应 tool_use 的 assistant 回合。裁剪历史时请成对删除 tool_use 与 tool_result。`
         );
@@ -603,16 +611,25 @@ function buildModelRequest(options: {
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     if (msg.role === "system") {
-      apiMessages.push({
-        ...msg,
-        ...(Array.isArray(msg.content) ? { content: msg.content.map((b) => ({ ...b })) } : {}),
-      });
+      const copy = { ...msg };
+      if (Array.isArray(msg.content)) {
+        copy.content = msg.content.map((b) => ({ ...b }));
+      }
+      apiMessages.push(copy);
       continue;
     }
-    const blocks: Anthropic.Beta.Messages.BetaContentBlockParam[] =
-      typeof msg.content === "string" ? [{ type: "text", text: msg.content }] : msg.content.map((b) => ({ ...b }));
+
+    let blocks: Anthropic.Beta.Messages.BetaContentBlockParam[];
+    if (typeof msg.content === "string") {
+      blocks = [{ type: "text", text: msg.content }];
+    } else {
+      blocks = msg.content.map((b) => ({ ...b }));
+    }
     const prefix = prependByIndex.get(i);
-    apiMessages.push({ role: msg.role, content: prefix ? [...prefix, ...blocks] : blocks });
+    if (prefix) {
+      blocks = [...prefix, ...blocks];
+    }
+    apiMessages.push({ role: msg.role, content: blocks });
 
     const after = insertAfterIndex.get(i);
     if (after) apiMessages.push({ role: "user", content: after });
@@ -640,9 +657,12 @@ function buildModelRequest(options: {
   const request: BetaStreamParams = {
     model,
     max_tokens: maxTokens,
-    system: addCacheBreakpoints ? [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }] : systemPrompt,
+    system: systemPrompt,
     messages: apiMessages,
   };
+  if (addCacheBreakpoints) {
+    request.system = [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }];
+  }
   if (apiTools.length > 0) request.tools = apiTools;
   if (thinking) {
     request.thinking = thinking;
@@ -770,29 +790,21 @@ async function executeToolCall(
     let running = true;
     const reportProgress = (progress: AgentToolProgress) => {
       if (!running || !onEvent) return;
-      emitEvent(onEvent, {
-        type: "tool_progress",
-        id: block.id,
-        name: block.name,
-        ...(progress?.text !== undefined ? { text: progress.text } : {}),
-        ...(progress?.details !== undefined ? { details: progress.details } : {}),
-      });
+      const event: AgentEvent = { type: "tool_progress", id: block.id, name: block.name };
+      if (progress?.text !== undefined) event.text = progress.text;
+      if (progress?.details !== undefined) event.details = progress.details;
+      emitEvent(onEvent, event);
     };
 
     try {
       const parsed = tool.parse(structuredClone(block.input));
-      const output = await tool.run(parsed, {
-        signal,
-        toolUseId: block.id,
-        ...(onEvent ? { reportProgress } : {}),
-      });
+      const context: AgentToolContext = { signal, toolUseId: block.id };
+      if (onEvent) context.reportProgress = reportProgress;
+      const output = await tool.run(parsed, context);
+
       if (typeof output === "object" && output !== null && !Array.isArray(output) && "content" in output) {
-        resultBlock = {
-          type: "tool_result",
-          tool_use_id: block.id,
-          content: output.content,
-          ...(output.isError ? { is_error: true } : {}),
-        };
+        resultBlock = { type: "tool_result", tool_use_id: block.id, content: output.content };
+        if (output.isError) resultBlock.is_error = true;
         details = output.details;
       } else {
         resultBlock = { type: "tool_result", tool_use_id: block.id, content: output };
@@ -804,11 +816,14 @@ async function executeToolCall(
         (Object.is(err, signal!.reason) ||
           e?.name === "AbortError" ||
           (e?.cause !== undefined && Object.is(e.cause, signal!.reason)));
-      const errMsg = abortedBySignal
-        ? "因运行已取消，该工具调用在执行中途被中断，可能已产生部分副作用；后续操作前请先核实当前状态。"
-        : err instanceof Error
-          ? err.message
-          : String(err);
+      let errMsg: string;
+      if (abortedBySignal) {
+        errMsg = "因运行已取消，该工具调用在执行中途被中断，可能已产生部分副作用；后续操作前请先核实当前状态。";
+      } else if (err instanceof Error) {
+        errMsg = err.message;
+      } else {
+        errMsg = String(err);
+      }
       resultBlock = errorToolResult(block.id, errMsg);
     } finally {
       running = false;
@@ -816,14 +831,15 @@ async function executeToolCall(
   }
 
   if (onEvent) {
-    emitEvent(onEvent, {
+    const endEvent: AgentEvent = {
       type: "tool_end",
       id: block.id,
       name: block.name,
       isError: resultBlock.is_error === true,
       outputSummary: summarizeToolOutput(resultBlock.content),
-      ...(details !== undefined ? { details } : {}),
-    });
+    };
+    if (details !== undefined) endEvent.details = details;
+    emitEvent(onEvent, endEvent);
   }
 
   return resultBlock;
@@ -834,11 +850,12 @@ function summarizeToolOutput(output: ToolOutput): string {
   if (output === undefined || output === null) return "";
   if (typeof output === "string") return sliceStringSafe(output, TOOL_SUMMARY_MAX_CHARS);
   try {
-    const summary = output.map((block) =>
-      block.type === "image"
-        ? { type: "text", text: `[图片: ${block.source.type === "base64" ? block.source.media_type : block.source.type}]` }
-        : block
-    );
+    const summary = output.map((block) => {
+      if (block.type !== "image") return block;
+      let media: string = block.source.type;
+      if (block.source.type === "base64") media = block.source.media_type;
+      return { type: "text", text: `[图片: ${media}]` };
+    });
     return sliceStringSafe(JSON.stringify(summary) ?? "", TOOL_SUMMARY_MAX_CHARS);
   } catch {
     return "[复杂工具输出]";
@@ -885,8 +902,15 @@ function isExpiredSystem(message: Message, index: number, lastUserIndex: number)
   return Array.isArray(message.content) && message.content.every((b) => b.type === "text" && !b.cache_control);
 }
 
+function findLastUserIndex(messages: readonly Message[]): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") return i;
+  }
+  return -1;
+}
+
 function estimateInputTokens(messages: readonly Message[], fixedInputTokens: number): number {
-  const lastUserIndex = messages.reduce((last, m, i) => (m.role === "user" ? i : last), -1);
+  const lastUserIndex = findLastUserIndex(messages);
   let total = fixedInputTokens;
   for (let i = 0; i < messages.length; i++) {
     if (!isExpiredSystem(messages[i], i, lastUserIndex)) {
@@ -912,7 +936,8 @@ function withoutThinking(message: Message): Message | null {
   const hasAny = message.content.some((b) => b.type === "thinking" || b.type === "redacted_thinking");
   if (!hasAny) return message;
   const content = message.content.filter((b) => b.type !== "thinking" && b.type !== "redacted_thinking");
-  return content.length > 0 ? ({ ...message, content } as Message) : null;
+  if (content.length === 0) return null;
+  return { ...message, content } as Message;
 }
 
 /** 检查删减消息后是否导致内联 `system` 意外变成首条消息，或紧邻 `user` 产生非法位置。 */
@@ -947,11 +972,14 @@ function serializeContentForSummary(content: unknown): string {
   if (block.type === "image") return "[较早的图片已省略；保留已有观察记录，不要推测图片内容。]";
   if (block.type === "tool_use") return `[工具调用 ${block.name}，ID=${block.id}]\n${JSON.stringify(block.input)}`;
   if (block.type === "tool_result") {
-    return `[工具结果 ${block.tool_use_id}${block.is_error ? "，错误" : ""}]\n${serializeContentForSummary(block.content)}`;
+    let errorTag = "";
+    if (block.is_error) errorTag = "，错误";
+    return `[工具结果 ${block.tool_use_id}${errorTag}]\n${serializeContentForSummary(block.content)}`;
   }
   if (block.type === "document") {
     const source = block.source as Record<string, unknown> | undefined;
-    const text = source?.type === "text" ? String(source.data ?? "") : serializeContentForSummary(source?.content);
+    let text = serializeContentForSummary(source?.content);
+    if (source?.type === "text") text = String(source.data ?? "");
     return `[文档 ${String(block.title ?? "")}]\n${text || "[二进制文档已省略；保留已有观察记录。]"}`;
   }
   return JSON.stringify(block);
@@ -1005,14 +1033,16 @@ async function compactMessages(options: {
   // 1. 计算当前上下文估算开销与目标输入预算
   const safetyTokens = Math.min(8192, Math.ceil(contextWindow * 0.05));
   const normalInputBudget = contextWindow - maxTokens - safetyTokens;
-  const lastUserIndex = messages.reduce((last, m, i) => (m.role === "user" ? i : last), -1);
+  const lastUserIndex = findLastUserIndex(messages);
   const tokenScale = contextUsage?.tokenScale ?? 1;
   const calibratedCount = contextUsage?.messageCount ?? 0;
   const fixedTokens = fixedInputTokens * tokenScale;
 
   const messageCost = (msg: Message, idx: number): number => {
     if (isExpiredSystem(msg, idx, lastUserIndex)) return 0;
-    return (estimateContent(msg.content) + 8) * (idx < calibratedCount ? tokenScale : 1);
+    const base = estimateContent(msg.content) + 8;
+    if (idx < calibratedCount) return base * tokenScale;
+    return base;
   };
   const messageTokens = messages.map(messageCost);
   const estimatedTokensBefore = Math.ceil(fixedTokens + messageTokens.reduce((sum, n) => sum + n, 0));
@@ -1020,7 +1050,10 @@ async function compactMessages(options: {
   if (!force && estimatedTokensBefore <= normalInputBudget) {
     return null;
   }
-  const inputBudget = force ? Math.min(normalInputBudget, Math.floor(estimatedTokensBefore * 0.8)) : normalInputBudget;
+  let inputBudget = normalInputBudget;
+  if (force) {
+    inputBudget = Math.min(normalInputBudget, Math.floor(estimatedTokensBefore * 0.8));
+  }
 
   // 2. 保留开头有效 system，确定安全切分候选回合（保护最新回合、进行中的工具回合与中间有效 system）
   let leadingSystems = 0;
@@ -1038,15 +1071,17 @@ async function compactMessages(options: {
   const turns = groupIntoTurns(messages);
   const lastTurn = turns.at(-1);
   const lastAssistant = [...turns].reverse().find((t) => t.role === "assistant");
-  const activeToolStart = lastAssistant?.toolUseIds.size ? lastAssistant.firstIndex : messages.length;
+  let activeToolStart = messages.length;
+  if (lastAssistant && lastAssistant.toolUseIds.size > 0) {
+    activeToolStart = lastAssistant.firstIndex;
+  }
   const middleSystem = messages.findIndex(
     (m, i) => i >= leadingSystems && m.role === "system" && !isExpiredSystem(m, i, lastUserIndex)
   );
-  const protectedStart = Math.min(
-    lastTurn?.firstIndex ?? 0,
-    activeToolStart,
-    middleSystem < 0 ? messages.length : middleSystem
-  );
+  let protectedStart = Math.min(lastTurn?.firstIndex ?? 0, activeToolStart);
+  if (middleSystem >= 0) {
+    protectedStart = Math.min(protectedStart, middleSystem);
+  }
 
   const candidates = turns.filter(
     (t) =>
@@ -1061,11 +1096,14 @@ async function compactMessages(options: {
   // 3. 计算保留尾部的开销并选出切分点（留出约 40% 余量，避免每轮都重做摘要）
   const retained = messages.map((m, i) => {
     if (isExpiredSystem(m, i, lastUserIndex)) return null;
-    return i < activeToolStart ? withoutThinking(m) : m;
+    if (i < activeToolStart) return withoutThinking(m);
+    return m;
   });
   const suffixTokens = new Array<number>(messages.length + 1).fill(0);
   for (let i = messages.length - 1; i >= 0; i--) {
-    suffixTokens[i] = suffixTokens[i + 1] + (retained[i] ? messageCost(retained[i]!, i) : 0);
+    let cost = 0;
+    if (retained[i]) cost = messageCost(retained[i]!, i);
+    suffixTokens[i] = suffixTokens[i + 1] + cost;
   }
   const summaryOverhead = estimateText(SUMMARY_PREFIX) + 8;
   const targetSuffix = Math.floor(available * 0.6) - summaryTextBudget - summaryOverhead;
@@ -1087,7 +1125,10 @@ async function compactMessages(options: {
   let cursor = 0;
   while (cursor < history.length) {
     signal?.throwIfAborted();
-    const header = summary ? `已有摘要：\n${summary}\n\n后续历史片段：\n` : "历史片段：\n";
+    let header = "历史片段：\n";
+    if (summary) {
+      header = `已有摘要：\n${summary}\n\n后续历史片段：\n`;
+    }
     const fragmentBudget = summaryInputBudget - estimateText(summarySystem) - estimateText(header) - 32;
     if (fragmentBudget < 64) throw new Error("摘要请求没有足够的输入空间。");
     const fragment = takeSummaryFragment(history, cursor, fragmentBudget);
@@ -1157,7 +1198,8 @@ function errnoCode(err: unknown): string | undefined {
 }
 
 function formatBytes(bytes: number): string {
-  return bytes >= 1024 * 1024 ? `${bytes / (1024 * 1024)} MiB` : `${bytes / 1024} KiB`;
+  if (bytes >= 1024 * 1024) return `${bytes / (1024 * 1024)} MiB`;
+  return `${bytes / 1024} KiB`;
 }
 
 /** 向下回退到合法 UTF-8 字符结束边界，避免前缀截断切碎多字节字符。 */
@@ -1204,7 +1246,10 @@ export class HeadTailBuffer {
 
     if (chunk.length > 0) {
       this.headSealed = true;
-      const merged = chunk.length >= this.tailLimit ? chunk : Buffer.concat([this.tail, chunk]);
+      let merged = chunk;
+      if (chunk.length < this.tailLimit) {
+        merged = Buffer.concat([this.tail, chunk]);
+      }
       if (merged.length < this.tailLimit) {
         this.tail = merged;
       } else {
@@ -1224,10 +1269,12 @@ export class HeadTailBuffer {
       return stripTrailingNewline(Buffer.concat([this.head, this.tail]).toString("utf-8"));
     }
     const omitted = Math.max(1, this.decodedBytes - this.head.length - this.tail.length);
-    const logNote = savedLog
-      ? `；${savedLog.complete ? "完整输出" : `开头 ${formatBytes(MAX_BASH_LOG_BYTES)} 输出（超出上限部分未记录）`}已保存至 ${savedLog.path}` +
-        `（可用 bash 检索或分段查看，如 rg/grep -n、sed -n 'X,Yp'、tail）`
-      : "";
+    let logNote = "";
+    if (savedLog) {
+      let scope = `开头 ${formatBytes(MAX_BASH_LOG_BYTES)} 输出（超出上限部分未记录）`;
+      if (savedLog.complete) scope = "完整输出";
+      logNote = `；${scope}已保存至 ${savedLog.path}（可用 bash 检索或分段查看，如 rg/grep -n、sed -n 'X,Yp'、tail）`;
+    }
     return stripTrailingNewline(
       `${this.head.toString("utf-8")}\n... [中间已省略 ${omitted} 字节，总输出 ${this.totalBytes} 字节${logNote}] ...\n${this.tail.toString("utf-8")}`
     );
@@ -1449,9 +1496,13 @@ export function runBashProcessGroup(
         if (spawnErr) return reject(spawnErr);
         if (stopMode === "abort") return reject(signal?.reason);
         if (stopMode === "timeout") {
-          return reject(new Error(`命令执行超时（超过 ${timeoutMs}ms 已终止）${output ? `：\n${output}` : "。"}`));
+          let suffix = "。";
+          if (output) suffix = `：\n${output}`;
+          return reject(new Error(`命令执行超时（超过 ${timeoutMs}ms 已终止）${suffix}`));
         }
-        resolve({ exitCode, exitSignal, output, ...(savedLog ? { log: savedLog } : {}) });
+        const result: BashRunResult = { exitCode, exitSignal, output };
+        if (savedLog) result.log = savedLog;
+        resolve(result);
       });
     };
 
@@ -1555,7 +1606,8 @@ async function resolveExistingRealPath(targetPath: string): Promise<string> {
   while (true) {
     try {
       const realCurrent = await fs.realpath(current);
-      return tailParts.length > 0 ? path.join(realCurrent, ...tailParts.reverse()) : realCurrent;
+      if (tailParts.length === 0) return realCurrent;
+      return path.join(realCurrent, ...tailParts.reverse());
     } catch (err) {
       if (errnoCode(err) !== "ENOENT") throw err;
       const st = await fs.lstat(current).catch(() => null);
@@ -1603,7 +1655,8 @@ async function atomicWriteFile(targetPath: string, content: string, signal?: Abo
   }
 
   const tmpPath = path.join(path.dirname(targetPath), `.agent.${process.pid}.${randomBytes(6).toString("hex")}.tmp`);
-  const mode = existing ? existing.mode & 0o777 : 0o666;
+  let mode = 0o666;
+  if (existing) mode = existing.mode & 0o777;
 
   let handle: fs.FileHandle | undefined;
   let created = false;
@@ -1713,12 +1766,14 @@ async function readImage(buf: Buffer, filePath: string, signal?: AbortSignal): P
     withoutEnlargement: true,
   });
   const preferred = base.clone();
-  const encoded =
-    format === "jpeg"
-      ? preferred.jpeg({ quality: 90, chromaSubsampling: "4:4:4" })
-      : format === "webp"
-        ? preferred.webp({ quality: 90 })
-        : preferred.png();
+  let encoded: import("sharp").Sharp;
+  if (format === "jpeg") {
+    encoded = preferred.jpeg({ quality: 90, chromaSubsampling: "4:4:4" });
+  } else if (format === "webp") {
+    encoded = preferred.webp({ quality: 90 });
+  } else {
+    encoded = preferred.png();
+  }
   let result = await encoded.toBuffer({ resolveWithObject: true });
   signal?.throwIfAborted();
 
@@ -1738,8 +1793,9 @@ async function readImage(buf: Buffer, filePath: string, signal?: AbortSignal): P
     );
   }
 
-  const mediaType =
-    result.info.format === "jpeg" ? "image/jpeg" : result.info.format === "webp" ? "image/webp" : "image/png";
+  let mediaType: "image/jpeg" | "image/webp" | "image/png" = "image/png";
+  if (result.info.format === "jpeg") mediaType = "image/jpeg";
+  else if (result.info.format === "webp") mediaType = "image/webp";
   const notes = [
     `已读取图片 ${filePath}：原图转正后尺寸 ${metadata.autoOrient.width}x${metadata.autoOrient.height}，` +
       `实际发送尺寸 ${result.info.width}x${result.info.height}（${mediaType}）。`,
@@ -1757,7 +1813,8 @@ async function readImage(buf: Buffer, filePath: string, signal?: AbortSignal): P
 
 /** 将文件内容格式化为带 1 基行号的分页展示文本（剥离展示侧 BOM，受 `MAX_READ_CHARS` 保护）。 */
 function formatReadText(decodedText: string, offset?: number, limit?: number): string {
-  const text = decodedText.charCodeAt(0) === 0xfeff ? decodedText.slice(1) : decodedText;
+  let text = decodedText;
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
   if (text.length === 0) return "（空文件）";
 
   const lines = text.split(/\r?\n/);
@@ -1767,14 +1824,17 @@ function formatReadText(decodedText: string, offset?: number, limit?: number): s
     return `（offset ${offset} 超出文件末尾；总行数：${lines.length}）`;
   }
 
-  const end = limit ? Math.min(start + limit, lines.length) : lines.length;
+  let end = lines.length;
+  if (limit) end = Math.min(start + limit, lines.length);
   const parts: string[] = [];
   let used = 0;
   let completeLines = 0;
   let truncated = false;
 
   for (let i = start; i < end; i++) {
-    const piece = `${i > start ? "\n" : ""}${String(i + 1).padStart(4, " ")} | ${lines[i]}`;
+    let prefix = "";
+    if (i > start) prefix = "\n";
+    const piece = `${prefix}${String(i + 1).padStart(4, " ")} | ${lines[i]}`;
     if (used + piece.length > MAX_READ_CHARS) {
       parts.push(sliceStringSafe(piece, MAX_READ_CHARS - used));
       truncated = true;
@@ -1787,15 +1847,19 @@ function formatReadText(decodedText: string, offset?: number, limit?: number): s
   const numbered = parts.join("");
 
   if (truncated) {
-    const shownRange = completeLines === 1 ? `第 ${start + 1} 行` : `第 ${start + 1}-${start + completeLines} 行`;
-    const hint =
-      completeLines > 0
-        ? `${shownRange}已完整显示；可指定 offset=${start + completeLines + 1} 继续读取。`
-        : `第 ${start + 1} 行单行即超过字符上限，无法用此工具继续读取；请改用 bash（如 \`sed -n '${start + 1}p' <文件路径> | cut -c 1-20000\`）分段读取。`;
+    let shownRange = `第 ${start + 1}-${start + completeLines} 行`;
+    if (completeLines === 1) shownRange = `第 ${start + 1} 行`;
+    let hint: string;
+    if (completeLines > 0) {
+      hint = `${shownRange}已完整显示；可指定 offset=${start + completeLines + 1} 继续读取。`;
+    } else {
+      hint = `第 ${start + 1} 行单行即超过字符上限，无法用此工具继续读取；请改用 bash（如 \`sed -n '${start + 1}p' <文件路径> | cut -c 1-20000\`）分段读取。`;
+    }
     return `${numbered}\n... [已在 ${MAX_READ_CHARS} 字符处截断。文件共 ${lines.length} 行。${hint}]`;
   }
   if (end < lines.length) {
-    const shownRange = start + 1 === end ? `第 ${end} 行` : `第 ${start + 1}-${end} 行`;
+    let shownRange = `第 ${start + 1}-${end} 行`;
+    if (start + 1 === end) shownRange = `第 ${end} 行`;
     return `${numbered}\n... [当前显示${shownRange}（共 ${lines.length} 行），剩余 ${lines.length - end} 行。可指定 offset=${end + 1} 继续读取。]`;
   }
   return numbered;
@@ -1830,7 +1894,10 @@ function applyTextEdits(
 ): { updated: string; firstChangedLine: number } {
   const hasCrLf = rawContent.includes("\r\n");
   const isPureCrLfFile = hasCrLf && !/(?<!\r)\n/.test(rawContent);
-  const label = (i: number) => (edits.length === 1 ? "old_text" : `edits[${i}].old_text`);
+  const label = (i: number) => {
+    if (edits.length === 1) return "old_text";
+    return `edits[${i}].old_text`;
+  };
 
   const located = edits.map(({ old_text, new_text }, i) => {
     let targetOld = old_text;
@@ -1858,8 +1925,10 @@ function applyTextEdits(
       );
     }
 
-    const targetNew =
-      isPureCrLfFile || matchedViaCrLfFallback ? new_text.replace(/\r?\n/g, "\r\n") : new_text;
+    let targetNew = new_text;
+    if (isPureCrLfFile || matchedViaCrLfFallback) {
+      targetNew = new_text.replace(/\r?\n/g, "\r\n");
+    }
     return { index: i, start: matches[0], end: matches[0] + targetOld.length, text: targetNew };
   });
 
@@ -2009,8 +2078,10 @@ export function createEditTool(workspace: string) {
       const { updated, firstChangedLine } = applyTextEdits(rawContent, edits, file_path);
 
       await atomicWriteFile(fullPath, updated, sig);
+      let content = `已成功对 ${file_path} 应用 ${edits.length} 处编辑`;
+      if (edits.length === 1) content = `已成功编辑 ${file_path}`;
       return {
-        content: edits.length === 1 ? `已成功编辑 ${file_path}` : `已成功对 ${file_path} 应用 ${edits.length} 处编辑`,
+        content,
         details: { path: file_path, edits: edits.length, firstChangedLine },
       };
     },
@@ -2037,7 +2108,10 @@ function createThrottledTextReporter(report: (progress: AgentToolProgress) => vo
     clearTimeout(timer);
     timer = undefined;
     if (!pending && !skipped) return;
-    const text = skipped > 0 ? `[... 已省略 ${skipped} 个字符 ...]\n${pending}` : pending;
+    let text = pending;
+    if (skipped > 0) {
+      text = `[... 已省略 ${skipped} 个字符 ...]\n${pending}`;
+    }
     pending = "";
     skipped = 0;
     report({ text });
@@ -2063,27 +2137,34 @@ export function createBashTool(workspace: string, options?: BashToolOptions) {
   const root = path.resolve(workspace);
   const logDirOption = options?.logDir;
   let defaultLogDir: string | undefined;
-  const resolveBashLogDir: (() => string) | undefined =
-    logDirOption === null
-      ? undefined
-      : logDirOption !== undefined
-        ? () => path.resolve(root, logDirOption)
-        : () => (defaultLogDir ??= mkdtempSync(path.join(os.tmpdir(), "agent-bash-logs-")));
+  let resolveBashLogDir: (() => string) | undefined;
+  if (logDirOption !== null) {
+    if (logDirOption !== undefined) {
+      resolveBashLogDir = () => path.resolve(root, logDirOption);
+    } else {
+      resolveBashLogDir = () => (defaultLogDir ??= mkdtempSync(path.join(os.tmpdir(), "agent-bash-logs-")));
+    }
+  }
+
+  let description =
+    "在工作区中执行前台 bash 命令；命令退出时，同一进程组内的后台子进程会被一并终止。" +
+    `输出过长时仅保留开头 ${formatBytes(BASH_HEAD_BYTES)} 与末尾 ${formatBytes(BASH_TAIL_BYTES)}`;
+  if (resolveBashLogDir) {
+    description += `，并尽力将输出另存为日志文件（上限 ${formatBytes(MAX_BASH_LOG_BYTES)}）；若保存成功，结果中会注明日志路径及是否完整。`;
+  } else {
+    description += "。";
+  }
 
   return defineTool({
     name: "bash",
-    description:
-      "在工作区中执行前台 bash 命令；命令退出时，同一进程组内的后台子进程会被一并终止。" +
-      `输出过长时仅保留开头 ${formatBytes(BASH_HEAD_BYTES)} 与末尾 ${formatBytes(BASH_TAIL_BYTES)}` +
-      (resolveBashLogDir
-        ? `，并尽力将输出另存为日志文件（上限 ${formatBytes(MAX_BASH_LOG_BYTES)}）；若保存成功，结果中会注明日志路径及是否完整。`
-        : "。"),
+    description,
     inputSchema: z.object({
       command: z.string().min(1),
       timeout_ms: z.number().int().min(100).max(300_000).optional(),
     }),
     run: async ({ command, timeout_ms }, { signal: sig, reportProgress }) => {
-      const progress = reportProgress ? createThrottledTextReporter(reportProgress) : undefined;
+      let progress: ReturnType<typeof createThrottledTextReporter> | undefined;
+      if (reportProgress) progress = createThrottledTextReporter(reportProgress);
       let result: BashRunResult;
       try {
         result = await runBashProcessGroup(command, root, timeout_ms ?? 30_000, {
@@ -2097,12 +2178,24 @@ export function createBashTool(workspace: string, options?: BashToolOptions) {
       }
 
       const { exitCode, exitSignal, output, log } = result;
-      const details = { exitCode, exitSignal, ...(log ? { log } : {}) };
+      const details: { exitCode: number | null; exitSignal: NodeJS.Signals | null; log?: BashRunResult["log"] } = {
+        exitCode,
+        exitSignal,
+      };
+      if (log) details.log = log;
+
       if (exitCode !== 0) {
-        const signalDesc = exitSignal ? `信号 ${exitSignal}` : "未知信号";
-        const statusDesc = exitCode !== null ? `退出码 ${exitCode}` : signalDesc;
-        const emptyNote =
-          exitCode !== null ? `（命令以退出码 ${exitCode} 退出，无输出）` : `（命令因${signalDesc}终止，无输出）`;
+        let statusDesc: string;
+        let emptyNote: string;
+        if (exitCode !== null) {
+          statusDesc = `退出码 ${exitCode}`;
+          emptyNote = `（命令以退出码 ${exitCode} 退出，无输出）`;
+        } else {
+          let signalDesc = "未知信号";
+          if (exitSignal) signalDesc = `信号 ${exitSignal}`;
+          statusDesc = signalDesc;
+          emptyNote = `（命令因${signalDesc}终止，无输出）`;
+        }
         return { content: `命令执行失败（${statusDesc}）：\n${output || emptyNote}`, isError: true, details };
       }
       return { content: output || "（命令正常退出，退出码 0，无输出）", details };
