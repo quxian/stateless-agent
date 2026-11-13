@@ -114,9 +114,9 @@ export interface AgentOptions {
   /** 是否在无显式 `cache_control` 时自动为 `system`、末尾工具与末尾消息添加 `ephemeral` 断点（默认 `true`）。 */
   autoCacheBreakpoints?: boolean;
   signal?: AbortSignal;
-  /** 每新增一条完整消息时按序调用并完整等待（不因 `signal` 放弃）；抛错将中止运行并通过 `AgentRunError` 带出快照。 */
+  /** 每新增一条完整消息时按序调用并完整等待（不因 `signal` 放弃；工具结果在整批结束后作为一条消息落盘）；抛错将中止运行并通过 `AgentRunError` 带出快照。 */
   onMessage?: (message: Readonly<Anthropic.Beta.Messages.BetaMessageParam>) => void | Promise<void>;
-  /** 只读观察回调：同步与异步异常均被隔离，不阻塞主流程。 */
+  /** 只读观察回调：同步与异步异常均被隔离；不等待返回的 Promise，但同步逻辑仍在当前调用栈执行。 */
   onEvent?: (event: AgentEvent) => void | Promise<void>;
   /** 每批工具结果落盘后调用的增量上下文钩子；返回非空字符串时作为 `user` 消息追加并触发 `onMessage`。 */
   getContextInjection?: (context: { signal?: AbortSignal }) => Promise<string | null>;
@@ -243,6 +243,7 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
     if (!onMessage) return;
     persisting = true;
     await onMessage(msg);
+    // 勿放入 finally：onMessage 抛错时必须保持 persisting 为 true，防止外层 catch 在已取消时把落盘失败吞成 aborted
     persisting = false;
   };
 
@@ -745,11 +746,15 @@ async function executeToolCall(
   }
 
   if (onEvent) {
+    let clonedInput: unknown = block.input;
+    try {
+      clonedInput = structuredClone(block.input);
+    } catch {}
     emitEvent(onEvent, {
       type: "tool_start",
       id: block.id,
       name: block.name,
-      input: structuredClone(block.input),
+      input: clonedInput,
     });
   }
 
@@ -1324,8 +1329,10 @@ function isProcessGroupAlive(pid: number): boolean {
 }
 
 export interface BashRunOptions {
+  /** 在继承宿主 `process.env` 的基础上合并覆盖（`CI`、`GIT_PAGER`、`GIT_TERMINAL_PROMPT` 固定设为非交互值）。 */
   env?: NodeJS.ProcessEnv;
   signal?: AbortSignal;
+  /** 输出超出头尾摘要时按需保存日志的目录（单文件上限 64 MiB；保留的日志不会自动删除，由宿主负责清理）。 */
   logDir?: () => string;
   onOutput?: (text: string) => void;
 }
@@ -1453,6 +1460,14 @@ export function runBashProcessGroup(
       }
     };
 
+    const drainIfGroupDead = () => {
+      if (shellExited && (!pid || !isProcessGroupAlive(pid))) {
+        clearInterval(groupPollTimer);
+        clearTimeout(killEscalationTimer);
+        startDrain();
+      }
+    };
+
     /** 启动超时或取消的进程组终止序列：先发 SIGTERM 轮询，宽限期满仍未退尽则升级 SIGKILL。 */
     const terminate = (mode: "timeout" | "abort") => {
       if (settled) return;
@@ -1466,13 +1481,7 @@ export function runBashProcessGroup(
 
       sendProcessGroupSignal(pid, "SIGTERM");
 
-      groupPollTimer = setInterval(() => {
-        if (shellExited && (!pid || !isProcessGroupAlive(pid))) {
-          clearInterval(groupPollTimer);
-          clearTimeout(killEscalationTimer);
-          startDrain();
-        }
-      }, GROUP_POLL_MS);
+      groupPollTimer = setInterval(drainIfGroupDead, GROUP_POLL_MS);
       groupPollTimer.unref?.();
 
       // 保持 ref 状态，防止宿主事件循环在等待 SIGKILL 完成前提前退出
@@ -1497,14 +1506,7 @@ export function runBashProcessGroup(
       shellExited = true;
       exitCode = code;
       exitSignal = sig;
-      if (stopMode !== "none") {
-        if (!pid || !isProcessGroupAlive(pid)) {
-          clearInterval(groupPollTimer);
-          clearTimeout(killEscalationTimer);
-          startDrain();
-        }
-        return;
-      }
+      if (stopMode !== "none") return drainIfGroupDead();
       clearTimeout(timeoutTimer);
       startDrain();
     });
@@ -1580,7 +1582,10 @@ async function resolveWorkspacePath(workspaceRoot: string, filePath: string): Pr
   return realTarget;
 }
 
-/** 同目录独占临时文件 + `fsync` + `rename` 原子替换写入 UTF-8 文本文件。 */
+/**
+ * 同目录独占临时文件 + `fsync` + `rename` 原子替换写入 UTF-8 文本文件。
+ * 提交边界是 `rename`：提交前取消会删除临时文件并保持原目标不变；一旦进入 `rename` 即按完成返回，不再因取消改报失败。
+ */
 async function atomicWriteFile(targetPath: string, content: string, signal?: AbortSignal): Promise<void> {
   const existing = await fs.stat(targetPath).catch((err: unknown) => {
     if (errnoCode(err) === "ENOENT") return null;
@@ -1911,6 +1916,19 @@ export function createReadTool(workspace: string) {
         throw new Error(`目标不是普通文件（如目录或特殊文件），无法读取：${file_path}`);
       }
 
+      const assertWithinLimit = (isImage: boolean, size: number) => {
+        if (isImage && size > MAX_IMAGE_FILE_BYTES) {
+          throw new Error(
+            `图片文件大小（${size} 字节）超过 ${formatBytes(MAX_IMAGE_FILE_BYTES)} 上限：${file_path}。请先压缩或缩小图片后再读取。`
+          );
+        }
+        if (!isImage && size > MAX_READ_BYTES) {
+          throw new Error(
+            `文件大小（${size} 字节）超过 ${formatBytes(MAX_READ_BYTES)} 上限，请改用 bash 工具（如 head/tail/rg）读取。`
+          );
+        }
+      };
+
       // 超出 5 MiB 文本上限时，先读前 12 字节确认是否为受支持图片，避免将超大非图片文件读入内存
       if (stat.size > MAX_READ_BYTES) {
         const handle = await fs.open(fullPath, "r");
@@ -1921,32 +1939,13 @@ export function createReadTool(workspace: string) {
         } finally {
           await handle.close();
         }
-        if (!isSupportedImage(head)) {
-          throw new Error(
-            `文件大小（${stat.size} 字节）超过 ${formatBytes(MAX_READ_BYTES)} 上限，请改用 bash 工具（如 head/tail/rg）读取。`
-          );
-        }
-        if (stat.size > MAX_IMAGE_FILE_BYTES) {
-          throw new Error(
-            `图片文件大小（${stat.size} 字节）超过 ${formatBytes(MAX_IMAGE_FILE_BYTES)} 上限：${file_path}。请先压缩或缩小图片后再读取。`
-          );
-        }
+        assertWithinLimit(isSupportedImage(head), stat.size);
       }
 
       const buf = await fs.readFile(fullPath, { signal: sig });
-      if (isSupportedImage(buf)) {
-        if (buf.length > MAX_IMAGE_FILE_BYTES) {
-          throw new Error(
-            `图片文件大小（${buf.length} 字节）超过 ${formatBytes(MAX_IMAGE_FILE_BYTES)} 上限：${file_path}。请先压缩或缩小图片后再读取。`
-          );
-        }
-        return readImage(buf, file_path, sig);
-      }
-      if (buf.length > MAX_READ_BYTES) {
-        throw new Error(
-          `文件大小（${buf.length} 字节）超过 ${formatBytes(MAX_READ_BYTES)} 上限，请改用 bash 工具（如 head/tail/rg）读取。`
-        );
-      }
+      const isImage = isSupportedImage(buf);
+      assertWithinLimit(isImage, buf.length);
+      if (isImage) return readImage(buf, file_path, sig);
       return formatReadText(decodeStrictUtf8(buf, file_path), offset, limit);
     },
   });
@@ -2017,8 +2016,9 @@ export function createEditTool(workspace: string) {
 }
 
 export interface BashToolOptions {
+  /** 在继承宿主 `process.env` 的基础上合并覆盖的子进程环境变量。 */
   env?: NodeJS.ProcessEnv;
-  /** 输出截断时保存日志的目录（相对路径基于 `workspace`）；省略则惰性创建临时目录，设为 `null` 则禁用日志保存。 */
+  /** 输出截断时保存日志的目录（相对路径基于 `workspace`）；省略则惰性创建临时目录，设为 `null` 则禁用。保留的日志不会自动删除，由宿主负责清理。 */
   logDir?: string | null;
 }
 
