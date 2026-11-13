@@ -746,10 +746,12 @@ async function executeToolCall(
   }
 
   if (onEvent) {
-    let clonedInput: unknown = block.input;
+    let clonedInput: unknown;
     try {
       clonedInput = structuredClone(block.input);
-    } catch {}
+    } catch {
+      // 无法构造独立快照时不暴露原始参数对象，防止观察回调改写历史或执行入参
+    }
     emitEvent(onEvent, {
       type: "tool_start",
       id: block.id,
@@ -1584,7 +1586,7 @@ async function resolveWorkspacePath(workspaceRoot: string, filePath: string): Pr
 
 /**
  * 同目录独占临时文件 + `fsync` + `rename` 原子替换写入 UTF-8 文本文件。
- * 提交边界是 `rename`：提交前取消会删除临时文件并保持原目标不变；一旦进入 `rename` 即按完成返回，不再因取消改报失败。
+ * 提交边界是 `rename`：提交前取消会删除临时文件并保持原目标不变；`rename` 成功后按完成返回，不再因取消改报失败。
  */
 async function atomicWriteFile(targetPath: string, content: string, signal?: AbortSignal): Promise<void> {
   const existing = await fs.stat(targetPath).catch((err: unknown) => {
