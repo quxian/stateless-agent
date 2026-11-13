@@ -28,7 +28,10 @@ import { randomBytes } from "node:crypto";
 // 1. 公开类型契约、运行错误与工具定义辅助
 // ============================================================================
 
-/** Agent 单次运行结束的原因：模型原生停止原因、达到最大轮次 `"max_turns"`、被取消 `"aborted"` 或初始值 `null`。 */
+/**
+ * 本次运行的结束原因，不代表用户任务已经完成。
+ * 保留模型原生原因（如 `end_turn`、`max_tokens`），另含轮次上限 `max_turns`、取消 `aborted`；`null` 表示没有停止原因。
+ */
 export type AgentStopReason =
   | Anthropic.Beta.Messages.BetaStopReason
   | "max_turns"
@@ -106,11 +109,12 @@ export type AgentContextBlock = Extract<
 export interface AgentOptions {
   client: Anthropic;
   model: string;
-  /** 当前有效上下文（不会就地修改传入数组）；下次运行传回 `result.messages` 或 `AgentRunError.messages`。 */
-  messages: Anthropic.Beta.Messages.BetaMessageParam[];
+  /** 当前有效上下文；不修改输入数组，但不深拷贝历史消息，交付后不要修改消息对象及其嵌套内容。下次运行传回结果或错误快照。 */
+  messages: readonly Anthropic.Beta.Messages.BetaMessageParam[];
   /** 模型上下文窗口上限（Token），用于预留输出、system 与工具定义后按需压缩。 */
   contextWindow: number;
-  tools?: AgentTool[];
+  /** 不修改输入数组；运行期间不要修改工具列表或工具定义。 */
+  tools?: readonly AgentTool[];
   systemPrompt?: string;
   /** 单次主模型请求输出上限；默认 `min(98304, floor(contextWindow / 4))`，必须小于 `contextWindow`。 */
   maxTokens?: number;
@@ -120,14 +124,19 @@ export interface AgentOptions {
   /** 是否在无显式 `cache_control` 时自动为 `system`、末尾工具与末尾消息添加 `ephemeral` 断点（默认 `true`）。 */
   autoCacheBreakpoints?: boolean;
   signal?: AbortSignal;
-  /** 每新增一条完整消息时按序调用并完整等待（不因 `signal` 放弃；工具结果在整批结束后作为一条消息落盘）；抛错将中止运行并通过 `AgentRunError` 带出快照。 */
+  /**
+   * 新增完整消息先加入上下文，再按序调用并等待此回调（不因 `signal` 放弃）；工具结果在整批结束后作为一条消息交付。
+   * 抛错会终止运行但不回滚消息，`AgentRunError.messages` 因此可能包含尚未确认保存成功的消息。
+   * 输入历史不会再次报告，摘要替换也不触发此回调；外部保存与失败处理由宿主负责。
+   */
   onMessage?: (message: Readonly<Anthropic.Beta.Messages.BetaMessageParam>) => void | Promise<void>;
   /** 只读观察回调：同步与异步异常均被隔离；不等待返回的 Promise，但同步逻辑仍在当前调用栈执行。 */
   onEvent?: (event: AgentEvent) => void | Promise<void>;
   /**
-   * 每批工具结果落盘后调用的增量上下文钩子：
+   * 每批工具结果追加并完成 `onMessage`（若提供）后调用的增量上下文钩子：
    * - 返回 `null`、`""` 或 `[]` 表示无新增内容；非空字符串或只读 `AgentContextBlock` 数组在通过基本结构检查并浅拷贝块顶层后，作为 `user` 消息追加并触发 `onMessage`；
    * - 宿主负责准备目标服务与模型支持的内容块（不经过内置 `read` 的图片处理），交付后不得再修改内容块及其嵌套数据；
+   * - 返回候选内容不等于已追加：取消或校验失败可能阻止接纳，宿主应分开读取与确认消费；已追加内容也可能留待下次运行才被模型处理；
    * - 图片与非文本源文档采用粗略启发式估算，且旧附件细节在上下文压缩时会被省略；任一块显式设置 `cache_control` 时，默认缓存断点策略整体让位。
    */
   getContextInjection?: (
@@ -137,17 +146,25 @@ export interface AgentOptions {
 
 /** `runAgent` 结束（自然完成、达到 `maxTurns` 或被取消）时返回的结果快照。 */
 export interface AgentResult {
+  /** 当前有效上下文，可能已经压缩；整体接回用于保存或续跑，不等同于原始记录或实际请求副本。 */
   messages: Anthropic.Beta.Messages.BetaMessageParam[];
+  /** 本次运行最近一次完整收到的主模型响应中的文本；可能为空、工具执行前的说明或截断文本，不保证是最终答案。 */
   lastText: string;
+  /** 本次运行的结束原因；正常返回也可能是取消、轮次耗尽或输出截断，由宿主决定后续动作。 */
   stopReason: AgentStopReason;
+  /** 主模型请求尝试数，包含恢复重试，不包含摘要请求。 */
   turns: number;
+  /** 已完整接收响应的累计用量，包含摘要请求；中断的流不计入。 */
   usage: AgentUsage;
 }
 
-/** 运行期间发生非取消异常时抛出，随附发生时刻的有效上下文、轮次与用量快照。 */
+/** 运行失败时携带进度快照；消息回调失败即使伴随取消也会抛出。执行前参数校验仍可能抛普通错误。 */
 export class AgentRunError extends Error {
+  /** 出错时的有效上下文，可能包含保存回调失败的消息；接回快照不代表外部保存已经成功。 */
   readonly messages: Anthropic.Beta.Messages.BetaMessageParam[];
+  /** 失败前的主模型请求尝试数，包含恢复重试，不包含摘要请求。 */
   readonly turns: number;
+  /** 失败前已完整接收响应的累计用量，包含摘要请求。 */
   readonly usage: AgentUsage;
 
   constructor(
@@ -247,7 +264,7 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
   let turns = 0;
   let fixedInputTokens = 0;
   let contextUsage: ContextUsageAnchor | undefined;
-  let persisting = false;
+  let onMessageFailed = false;
   const usage: AgentUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
 
   // 启动前若已取消，直接返回，不写入恢复消息
@@ -268,10 +285,12 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
   const appendMessage = async (msg: Message) => {
     messages.push(msg);
     if (!onMessage) return;
-    persisting = true;
-    await onMessage(msg);
-    // 勿放入 finally：onMessage 抛错时必须保持 persisting 为 true，防止外层 catch 在已取消时把落盘失败吞成 aborted
-    persisting = false;
+    try {
+      await onMessage(msg);
+    } catch (err) {
+      onMessageFailed = true;
+      throw err;
+    }
   };
 
   const compactIfNeeded = async (force = false) => {
@@ -353,7 +372,7 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
   try {
     fixedInputTokens = estimateText(systemPrompt) + estimateText(JSON.stringify(buildApiTools(tools))) + 16;
 
-    // 2. 恢复末尾悬空的工具调用：若上次运行在 assistant 发出 tool_use 后中断，补齐错误结果使对话可继续
+    // 2. 补齐末尾悬空的工具调用；新增 user 恢复回合经 onMessage 记录，保留它与后续 assistant 之间的日志回合边界
     const lastInitialTurn = groupIntoTurns(messages).at(-1);
     if (lastInitialTurn?.role === "assistant" && lastInitialTurn.toolUseIds.size > 0) {
       await appendMessage({
@@ -384,7 +403,7 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
         break;
       }
 
-      // 3.3 完整响应到达后先记用量并落盘消息；若最终回复与取消同时发生，以完成为准
+      // 3.3 完整响应到达后先记用量、追加消息并等待 onMessage；若最终回复与取消同时发生，以完成为准
       addUsage(response.usage);
       await appendMessage({ role: "assistant", content: response.content });
       contextUsage = anchorContextUsage(messages, fixedInputTokens, response.usage);
@@ -427,7 +446,7 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
         }
       }
 
-      // 整批工具结果先落盘保证历史配对，再响应取消
+      // 整批工具结果先追加并等待 onMessage，保证历史配对后再响应取消
       await appendMessage({ role: "user", content: toolResults });
       if (signal?.aborted) {
         stopReason = "aborted";
@@ -461,7 +480,8 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
 
     return { messages, lastText, stopReason, turns, usage };
   } catch (err: unknown) {
-    if (!persisting && signal?.aborted) {
+    // 消息回调失败优先于取消，保留错误与当时的上下文供宿主处理
+    if (!onMessageFailed && signal?.aborted) {
       return { messages, lastText, stopReason: "aborted", turns, usage };
     }
     throw new AgentRunError(formatErrorMessage(err), { messages, turns, usage }, { cause: err });
@@ -642,7 +662,7 @@ function buildApiTools(tools: readonly AgentTool[], addDefaultBreakpoint = false
 
 /**
  * 构造发往模型的单次请求参数副本（不修改调用方 `messages`）：
- * 1. 若历史中段存在缺少 `tool_result` 的 `tool_use`，在请求副本中临时补入“状态未知”错误结果；
+ * 1. 若历史中段存在缺少 `tool_result` 的 `tool_use`，仅在请求副本中补入“状态未知”结果，避免给有效上下文增加配对依赖而限制压缩切点；
  * 2. 若未显式配置任何 `cache_control` 且开启自动断点，在 `system`、末尾工具与末尾可缓存消息块上添加 `ephemeral`；
  * 3. 按需附带 `thinking` 与内联 `system.clear_at` 所需的 `betas` 标记。
  */
@@ -662,7 +682,7 @@ function buildModelRequest(options: {
   );
   const addCacheBreakpoints = allowDefaultCacheBreakpoints && !hasExplicitMessageCache;
 
-  // 找出历史中缺失结果的 tool_use，记录需要前插或后插的恢复块位置
+  // 适配已有历史，不改写原始记录或有效上下文；入口的尾部恢复则是需要记录的新增回合
   const turns = groupIntoTurns(messages);
   const prependByIndex = new Map<number, Anthropic.Beta.Messages.BetaToolResultBlockParam[]>();
   const insertAfterIndex = new Map<number, Anthropic.Beta.Messages.BetaToolResultBlockParam[]>();

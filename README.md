@@ -11,39 +11,25 @@ npm ci
 npm run typecheck
 ```
 
-配置 `ANTHROPIC_API_KEY`、`ANTHROPIC_MODEL`，使用兼容服务时配置 `ANTHROPIC_BASE_URL`。`contextWindow` 必填，应填写所选模型实际支持的上下文窗口；下面的 `200000` 仅为示例。
+配置 `ANTHROPIC_API_KEY`、`ANTHROPIC_MODEL`，使用兼容服务时配置 `ANTHROPIC_BASE_URL`。`contextWindow` 必填，应填写所选模型实际支持的上下文窗口。
+
+`example.ts` 展示两条明确用户输入的单进程内存会话，包括正常与异常快照接续、结束原因判断。它不包含文件会话存储或自动续跑。
+
+下面仅示意宿主的 JSONL 记录接点；`options`、`messages` 和本轮 `userMessage` 由宿主准备：
 
 ```ts
-import Anthropic from "@anthropic-ai/sdk";
+import type Anthropic from "@anthropic-ai/sdk";
 import { appendFile } from "node:fs/promises";
-import { AgentRunError, createReadTool, runAgent } from "./stateless-agent.ts";
+import { AgentRunError, runAgent } from "./stateless-agent.ts";
 
-const client = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  baseURL: process.env.ANTHROPIC_BASE_URL,
-});
+const recordMessage = (message: Readonly<Anthropic.Beta.Messages.BetaMessageParam>) =>
+  appendFile("conversation.jsonl", JSON.stringify(message) + "\n");
 
-let messages: Anthropic.Beta.Messages.BetaMessageParam[] = [
-  { role: "user", content: "读取 README.md，说明这个项目的用途。" },
-];
+await recordMessage(userMessage);
+messages = [...messages, userMessage];
 
 try {
-  const result = await runAgent({
-    client,
-    model: process.env.ANTHROPIC_MODEL!,
-    contextWindow: Number(process.env.ANTHROPIC_CONTEXT_WINDOW ?? 200_000),
-    tools: [createReadTool(process.cwd())],
-    messages,
-    onMessage: (message) =>
-      appendFile("conversation.jsonl", JSON.stringify(message) + "\n"),
-    onEvent: (event) => {
-      if (event.type === "text_delta") process.stdout.write(event.delta);
-      if (event.type === "compaction") {
-        console.log("\n上下文已压缩，估算 Token：",
-          event.estimatedTokensBefore, "→", event.estimatedTokensAfter);
-      }
-    },
-  });
+  const result = await runAgent({ ...options, messages, onMessage: recordMessage });
   messages = result.messages;
 } catch (error) {
   if (error instanceof AgentRunError) messages = error.messages;
@@ -51,20 +37,43 @@ try {
 }
 ```
 
-下一次运行使用保存的 `messages`，需要新任务时再追加用户消息。输入的用户消息由调用方自行保存；`onMessage` 只提供运行中新追加的完整消息。
+初始用户输入由宿主记录；`onMessage` 只提供本次运行中新追加的完整消息。上面的片段只追加原始记录并更新内存上下文；上下文快照的持久化由宿主另行完成，同一会话的运行和保存应串行处理。
 
 ## 上下文与记录
 
-| 接口 | 用途 |
+| 数据 | 入口与出口 | 用途 |
+| --- | --- | --- |
+| 原始追加记录 | 宿主记录的初始输入、`onMessage` 收到的新消息 | 保留完整记录；摘要替换不触发 `onMessage` |
+| 有效上下文 | 传入的 `messages`、`result.messages` / `AgentRunError.messages` | 供 `runAgent` 续跑；旧历史可能已被摘要替换，不就地修改调用方输入数组 |
+| 模型请求副本 | 内部构造 | 按需补齐缺失工具结果、添加缓存标记；与上下文快照和原始记录不保证逐项相同 |
+
+`onMessage` 按追加顺序调用并完整等待：消息先进入内存，再交给回调。回调失败会终止运行，`AgentRunError.messages` 仍保留该消息，取消也不会掩盖该错误。快照不表示存储已确认成功；保存可能未完成，也可能已写入后报错，需要宿主处理该次保存。使用快照续跑时，已有消息不会重新触发 `onMessage`，不能依赖续跑自动补写日志，也不能用压缩后的快照覆盖原始记录。
+
+恢复末尾悬空的 `tool_use` 时，会追加表示“执行状态未知”的 `user` 结果并交给 `onMessage`，保留后续 assistant 前的回合边界。历史中段缺失的结果只在请求副本中补齐，不改写既有记录或有效上下文，也不给压缩增加新的配对约束。恢复步骤不自动重执行旧工具；“未知”不代表工具未产生副作用。
+
+`onEvent` 用于观察流式输出、工具执行和压缩；异常被隔离，异步回调可能晚于运行结束。压缩状态包含在返回的 `messages` 中，运行中没有可靠的上下文检查点；`compaction` 只有估算信息，不承担保存。进程被强制终止时，不保证能够取得最终快照。
+
+### 运行中注入
+
+`getContextInjection` 在每批工具结果追加并完成 `onMessage`（若提供）后读取增量输入，接受非空字符串，或由 `text`、`image`、`document` 组成的只读 `AgentContextBlock` 数组；`null`、`""`、`[]` 表示无新增内容。入口检查基本结构，复制数组与内容块顶层后作为 `user` 消息追加并交给 `onMessage`。
+
+回调返回的是待追加内容：取消或校验失败可能阻止它进入上下文。队列读取不能直接把 `shift()` 等移除操作当作交付成功；宿主应在对应 `onMessage` 保存完成后确认消费，失败时结合错误快照处理。已经追加的内容也可能因随后取消或达到 `maxTurns` 而尚未发给模型。这个钩子不在首次请求前或最终回复后调用，也不能代替工具执行副作用前的检查。
+
+宿主需自行准备目标服务与模型支持的内容块；直接注入不经过内置 `read` 的图片校验与缩放。交付后不得再修改内容块及其嵌套数据；块上显式设置 `cache_control` 时，默认缓存断点策略整体让位。
+
+## 结束与接续
+
+`lastText` 是最近一次完整接收的主模型响应中的文本，可能为空、是工具调用前的说明，或因输出上限而不完整。正常返回表示本次调用结束，宿主需要结合 `stopReason` 决定后续操作：
+
+| `stopReason` | 含义与接续 |
 | --- | --- |
-| `messages` | 当前有效上下文；压缩时以摘要替换较早内容，不就地修改调用方输入 |
-| `result.messages` / `AgentRunError.messages` | 正常结束、取消或运行失败后的有效上下文，供保存和续跑 |
-| `onMessage` | 接收实际追加的完整消息，可保存原始记录；会等待回调完成，摘要替换不触发 |
-| `onEvent` | 观察流式输出、工具执行和压缩完成；异常被隔离，异步回调可能晚于运行结束 |
+| `end_turn` | 模型结束本轮；是否满足用户任务仍需判断，可以接收下一条用户输入 |
+| `max_tokens` | 达到单次输出上限，内容可能不完整；根据上下文决定是否调整输出预算或继续 |
+| `max_turns` | 达到主请求轮次上限；宿主明确决定是否继续，不应靠自动循环绕过限制 |
+| `aborted` | 本次运行已取消；保留上下文，不自动重启 |
+| 其他模型停止原因 | 按对应原因处理，不统一视为任务成功 |
 
-有效上下文用于继续推理，完整聊天记录由宿主管理。压缩状态已包含在返回的 `messages` 中，没有额外摘要检查点。`compaction` 事件是尽力通知，不承担可靠保存；需要保存上下文时使用正常或异常返回的消息快照。
-
-`getContextInjection` 在每批工具结果保存后读取增量输入（非空字符串，或由 `text`、`image`、`document` 组成的只读 `AgentContextBlock` 数组；`null`、`""`、`[]` 表示无新增内容）。入口在追加前检查基本结构以阻止已知不符合契约的内容进入历史，复制数组与内容块顶层后作为 `user` 消息追加并交给 `onMessage`。宿主需自行准备目标服务与模型支持的内容块（直接注入不经过内置 `read` 工具的图片校验与缩放），并在交付后不再修改内容块及其嵌套数据；块上显式设置 `cache_control` 时，默认缓存断点策略同样整体让位。它不在首次请求前或最终回复后调用，也不能代替工具执行副作用前的检查。
+下一次运行接回 `result.messages`；运行异常时先保留 `AgentRunError.messages` 再处理错误。普通参数校验错误不携带运行快照。新任务追加新的用户消息；继续未完成运行时，不重复追加原输入。接回快照不会自动解决保存失败或非法输入等错误。
 
 ## 自动压缩
 
@@ -84,6 +93,8 @@ try {
 ## 工具与验证
 
 内置工具可按需装配：`createReadTool`、`createWriteTool`、`createEditTool`、`createBashTool`；自定义工具使用 `defineTool`。工具在单次运行中串行执行，Bash 工具需要 POSIX 环境。
+
+`AgentToolResult.details` 仅随 `onEvent` 的 `tool_end` 透传，不进入 `messages` 或 `onMessage`；该观察通道不保证可靠保存。需要后续恢复的数据由工具或宿主另行保存。
 
 Agent 主循环、上下文压缩与内置工具始终保留在 `stateless-agent.ts` 单文件中。仓库不提交测试文件。
 
