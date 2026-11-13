@@ -96,6 +96,12 @@ export interface AgentUsage {
   cacheCreationTokens: number;
 }
 
+/** 可通过 `getContextInjection` 动态补充的模型输入内容块（文本、图片或文档）。 */
+export type AgentContextBlock = Extract<
+  Anthropic.Beta.Messages.BetaContentBlockParam,
+  { type: "text" | "image" | "document" }
+>;
+
 /** `runAgent` 入参选项。 */
 export interface AgentOptions {
   client: Anthropic;
@@ -118,8 +124,15 @@ export interface AgentOptions {
   onMessage?: (message: Readonly<Anthropic.Beta.Messages.BetaMessageParam>) => void | Promise<void>;
   /** 只读观察回调：同步与异步异常均被隔离；不等待返回的 Promise，但同步逻辑仍在当前调用栈执行。 */
   onEvent?: (event: AgentEvent) => void | Promise<void>;
-  /** 每批工具结果落盘后调用的增量上下文钩子；返回非空字符串时作为 `user` 消息追加并触发 `onMessage`。 */
-  getContextInjection?: (context: { signal?: AbortSignal }) => Promise<string | null>;
+  /**
+   * 每批工具结果落盘后调用的增量上下文钩子：
+   * - 返回 `null`、`""` 或 `[]` 表示无新增内容；非空字符串或只读 `AgentContextBlock` 数组在通过基本结构检查并浅拷贝块顶层后，作为 `user` 消息追加并触发 `onMessage`；
+   * - 宿主负责准备目标服务与模型支持的内容块（不经过内置 `read` 的图片处理），交付后不得再修改内容块及其嵌套数据；
+   * - 图片与非文本源文档采用粗略启发式估算，且旧附件细节在上下文压缩时会被省略；任一块显式设置 `cache_control` 时，默认缓存断点策略整体让位。
+   */
+  getContextInjection?: (
+    context: { signal?: AbortSignal }
+  ) => Promise<string | ReadonlyArray<AgentContextBlock> | null>;
 }
 
 /** `runAgent` 结束（自然完成、达到 `maxTurns` 或被取消）时返回的结果快照。 */
@@ -428,10 +441,11 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
           stopReason = "aborted";
           break;
         }
-        if (injected) {
+        const injectedBlocks = normalizeInjectedContext(injected);
+        if (injectedBlocks) {
           await appendMessage({
             role: "user",
-            content: [{ type: "text", text: injected }],
+            content: injectedBlocks,
           });
         }
         if (signal?.aborted) {
@@ -560,6 +574,53 @@ async function raceAbort<T>(fn: () => Promise<T> | T, signal?: AbortSignal): Pro
       }
     );
   });
+}
+
+/**
+ * 校验并规范化 `getContextInjection` 返回值，阻止已知不符合入口契约的内容进入历史：
+ * - `null`、`""`、`[]` 视为无新增内容，返回 `null`；
+ * - 非空字符串转换为单个 `text` 块；
+ * - 数组每项必须是 `text`（`text` 为非空字符串）、`image` 或 `document` 内容块对象，并复制数组与块顶层。
+ */
+function normalizeInjectedContext(
+  injected: string | ReadonlyArray<AgentContextBlock> | null
+): AgentContextBlock[] | null {
+  if (injected === null || injected === "") return null;
+  if (typeof injected === "string") {
+    return [{ type: "text", text: injected }];
+  }
+  if (!Array.isArray(injected)) {
+    throw new Error("getContextInjection 返回值无效：必须返回字符串、内容块数组或 null。");
+  }
+  if (injected.length === 0) return null;
+
+  const blocks: AgentContextBlock[] = [];
+  for (let i = 0; i < injected.length; i++) {
+    const raw = injected[i] as unknown;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new Error(`getContextInjection 返回的内容块 [${i}] 无效：必须是内容块对象。`);
+    }
+    const block = raw as Record<string, unknown>;
+    if (block.type === "text") {
+      if (typeof block.text !== "string" || block.text.length === 0) {
+        throw new Error(`getContextInjection 返回的 text 内容块 [${i}] 无效：text 必须是非空字符串。`);
+      }
+    } else if (block.type === "image" || block.type === "document") {
+      if (!block.source || typeof block.source !== "object" || Array.isArray(block.source)) {
+        throw new Error(`getContextInjection 返回的 ${block.type} 内容块 [${i}] 无效：缺少 source 对象。`);
+      }
+    } else {
+      let typeDesc: string = typeof block.type;
+      if (typeof block.type === "string") {
+        typeDesc = `'${block.type}'`;
+      }
+      throw new Error(
+        `getContextInjection 返回的内容块 [${i}] 类型无效（${typeDesc}）：仅允许 'text'、'image' 或 'document'。`
+      );
+    }
+    blocks.push({ ...(raw as AgentContextBlock) });
+  }
+  return blocks;
 }
 
 /** 从本地工具列表生成 API 工具声明；显式 `cache_control` 优先，默认断点仅放在末尾工具。 */
@@ -884,17 +945,41 @@ interface CompactedMessages {
   estimatedTokensAfter: number;
 }
 
+const IMAGE_HEURISTIC_TOKENS = 2048;
+const DOCUMENT_HEURISTIC_TOKENS = 4096;
+
 function estimateText(text: string): number {
   return Math.ceil(Buffer.byteLength(text, "utf8") / 3);
 }
 
+/**
+ * 本地估算消息或内容块的输入 Token 开销：
+ * 对图片与无法直接估算内容的文档源（如 `base64`、`url`、`file`）使用固定启发式估值，避免把传输编码误计为文本 Token。
+ * 实际用量仍取决于附件与模型；成功响应后的用量校准与有限超窗恢复只能缓解部分估算误差。
+ */
 function estimateContent(content: unknown): number {
   if (typeof content === "string") return estimateText(content);
   if (Array.isArray(content)) return content.reduce((sum, block) => sum + estimateContent(block), 0);
   if (!content || typeof content !== "object") return 0;
   const block = content as Record<string, unknown>;
-  if (block.type === "image") return 2048;
+  if (block.type === "image") return IMAGE_HEURISTIC_TOKENS;
   if (block.type === "text") return estimateText(String(block.text ?? "")) + 4;
+  if (block.type === "document") {
+    const source = block.source as Record<string, unknown> | undefined;
+    let tokens = DOCUMENT_HEURISTIC_TOKENS;
+    if (source?.type === "text") {
+      tokens = estimateText(String(source.data ?? ""));
+    } else if (source?.type === "content") {
+      tokens = estimateContent(source.content);
+    }
+    if (typeof block.title === "string" && block.title.length > 0) {
+      tokens += estimateText(block.title);
+    }
+    if (typeof block.context === "string" && block.context.length > 0) {
+      tokens += estimateText(block.context);
+    }
+    return tokens + 8;
+  }
   if (block.type === "tool_result") return estimateContent(block.content) + 16;
   if (block.type === "thinking") return estimateText(String(block.thinking ?? "")) + 8;
   if (block.type === "redacted_thinking") return 256;
