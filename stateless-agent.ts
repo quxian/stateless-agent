@@ -220,15 +220,19 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
   const toolNamesList = Array.from(toolMap.keys()).join(", ");
   const allowDefaultCacheBreakpoints =
     (options.autoCacheBreakpoints ?? true) && !tools.some((t) => t.cache_control);
-  let defaultPrompt = "你是一个乐于助人的助手。";
-  if (tools.length > 0) {
-    defaultPrompt = `你是一个乐于助人的助手，可以调用工具完成任务。可用工具：${toolNamesList}。`;
+  let systemPrompt = options.systemPrompt;
+  if (systemPrompt === undefined) {
+    if (tools.length > 0) {
+      systemPrompt = `你是一个乐于助人的助手，可以调用工具完成任务。可用工具：${toolNamesList}。`;
+    } else {
+      systemPrompt = "你是一个乐于助人的助手。";
+    }
   }
-  const systemPrompt = options.systemPrompt ?? defaultPrompt;
 
   let lastText = "";
   let stopReason: AgentStopReason = null;
   let turns = 0;
+  let fixedInputTokens = 0;
   let contextUsage: ContextUsageAnchor | undefined;
   let persisting = false;
   const usage: AgentUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
@@ -237,8 +241,6 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
   if (signal?.aborted) {
     return { messages, lastText, stopReason: "aborted", turns, usage };
   }
-
-  const fixedInputTokens = estimateText(systemPrompt) + estimateText(JSON.stringify(buildApiTools(tools))) + 16;
 
   // --- 本次运行的局部有状态操作 ---
 
@@ -336,6 +338,8 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
   };
 
   try {
+    fixedInputTokens = estimateText(systemPrompt) + estimateText(JSON.stringify(buildApiTools(tools))) + 16;
+
     // 2. 恢复末尾悬空的工具调用：若上次运行在 assistant 发出 tool_use 后中断，补齐错误结果使对话可继续
     const lastInitialTurn = groupIntoTurns(messages).at(-1);
     if (lastInitialTurn?.role === "assistant" && lastInitialTurn.toolUseIds.size > 0) {
@@ -446,9 +450,7 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
     if (!persisting && signal?.aborted) {
       return { messages, lastText, stopReason: "aborted", turns, usage };
     }
-    let message = String(err);
-    if (err instanceof Error) message = err.message;
-    throw new AgentRunError(message, { messages, turns, usage }, { cause: err });
+    throw new AgentRunError(formatErrorMessage(err), { messages, turns, usage }, { cause: err });
   }
 }
 
@@ -517,6 +519,15 @@ function assertToolResultsPaired(messages: readonly Message[]): void {
 
 function errorToolResult(toolUseId: string, content: string): Anthropic.Beta.Messages.BetaToolResultBlockParam {
   return { type: "tool_result", tool_use_id: toolUseId, is_error: true, content };
+}
+
+function formatErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  try {
+    return String(err);
+  } catch {
+    return "未知错误（无法字符串化的异常值）";
+  }
 }
 
 /** 隔离触发观察回调，不阻塞主流程。 */
@@ -819,10 +830,8 @@ async function executeToolCall(
       let errMsg: string;
       if (abortedBySignal) {
         errMsg = "因运行已取消，该工具调用在执行中途被中断，可能已产生部分副作用；后续操作前请先核实当前状态。";
-      } else if (err instanceof Error) {
-        errMsg = err.message;
       } else {
-        errMsg = String(err);
+        errMsg = formatErrorMessage(err);
       }
       resultBlock = errorToolResult(block.id, errMsg);
     } finally {
@@ -978,8 +987,12 @@ function serializeContentForSummary(content: unknown): string {
   }
   if (block.type === "document") {
     const source = block.source as Record<string, unknown> | undefined;
-    let text = serializeContentForSummary(source?.content);
-    if (source?.type === "text") text = String(source.data ?? "");
+    let text: string;
+    if (source?.type === "text") {
+      text = String(source.data ?? "");
+    } else {
+      text = serializeContentForSummary(source?.content);
+    }
     return `[文档 ${String(block.title ?? "")}]\n${text || "[二进制文档已省略；保留已有观察记录。]"}`;
   }
   return JSON.stringify(block);
@@ -1271,8 +1284,12 @@ export class HeadTailBuffer {
     const omitted = Math.max(1, this.decodedBytes - this.head.length - this.tail.length);
     let logNote = "";
     if (savedLog) {
-      let scope = `开头 ${formatBytes(MAX_BASH_LOG_BYTES)} 输出（超出上限部分未记录）`;
-      if (savedLog.complete) scope = "完整输出";
+      let scope: string;
+      if (savedLog.complete) {
+        scope = "完整输出";
+      } else {
+        scope = `开头 ${formatBytes(MAX_BASH_LOG_BYTES)} 输出（超出上限部分未记录）`;
+      }
       logNote = `；${scope}已保存至 ${savedLog.path}（可用 bash 检索或分段查看，如 rg/grep -n、sed -n 'X,Yp'、tail）`;
     }
     return stripTrailingNewline(
@@ -1847,10 +1864,10 @@ function formatReadText(decodedText: string, offset?: number, limit?: number): s
   const numbered = parts.join("");
 
   if (truncated) {
-    let shownRange = `第 ${start + 1}-${start + completeLines} 行`;
-    if (completeLines === 1) shownRange = `第 ${start + 1} 行`;
     let hint: string;
     if (completeLines > 0) {
+      let shownRange = `第 ${start + 1}-${start + completeLines} 行`;
+      if (completeLines === 1) shownRange = `第 ${start + 1} 行`;
       hint = `${shownRange}已完整显示；可指定 offset=${start + completeLines + 1} 继续读取。`;
     } else {
       hint = `第 ${start + 1} 行单行即超过字符上限，无法用此工具继续读取；请改用 bash（如 \`sed -n '${start + 1}p' <文件路径> | cut -c 1-20000\`）分段读取。`;
