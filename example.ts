@@ -31,6 +31,7 @@ let messages: AgentOptions["messages"] = [];
 for (const content of [
   "读取当前目录的 README.md，用三个要点概括这个项目的用途和职责边界。",
   "基于你上一轮的三个要点，用一句话向首次接入者说明调用方与 Agent 各自负责什么。",
+  "分析 stateless-agent.ts 这个文件",
 ]) {
   const input: Message = { role: "user", content };
   history.push(input);
@@ -40,7 +41,7 @@ for (const content of [
   try {
     const result = await runAgent({
       client,
-      model: process.env.ANTHROPIC_MODEL ?? "gpt-6-astra",
+      model: process.env.ANTHROPIC_MODEL ?? "gemini-4-hydrogen-xhigh",
       contextWindow: Number(process.env.ANTHROPIC_CONTEXT_WINDOW ?? 200_000),
       tools,
       systemPrompt: `You are an autonomous agent working in ${workspace}. Available tools: ${tools.map((t) => t.name).join(", ")}.`,

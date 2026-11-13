@@ -1701,7 +1701,8 @@ export function runBashProcessGroup(
 // 5. 本地文件/图片基础辅助与独立导出的内置工具工厂
 // ============================================================================
 
-const MAX_READ_CHARS = 30_000;
+const MAX_READ_LINES = 3_000;
+const MAX_READ_CHARS = 135_000;
 const MAX_READ_BYTES = 5 * 1024 * 1024;
 const MAX_IMAGE_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_IMAGE_EDGE = 2000;
@@ -1933,7 +1934,7 @@ async function readImage(buf: Buffer, filePath: string, signal?: AbortSignal): P
   ];
 }
 
-/** 将文件内容格式化为带 1 基行号的分页展示文本（剥离展示侧 BOM，受 `MAX_READ_CHARS` 保护）。 */
+/** 将文件内容格式化为带 1 基行号的分页展示文本（剥离展示侧 BOM，受 `MAX_READ_LINES` 与 `MAX_READ_CHARS` 保护）。 */
 function formatReadText(decodedText: string, offset?: number, limit?: number): string {
   let text = decodedText;
   if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
@@ -1946,8 +1947,8 @@ function formatReadText(decodedText: string, offset?: number, limit?: number): s
     return `（offset ${offset} 超出文件末尾；总行数：${lines.length}）`;
   }
 
-  let end = lines.length;
-  if (limit) end = Math.min(start + limit, lines.length);
+  const maxLines = Math.min(limit ?? MAX_READ_LINES, MAX_READ_LINES);
+  const end = Math.min(start + maxLines, lines.length);
   const parts: string[] = [];
   let used = 0;
   let completeLines = 0;
@@ -2094,12 +2095,12 @@ export function createReadTool(workspace: string) {
     name: "read",
     description:
       `读取 UTF-8 文本文件（上限 ${formatBytes(MAX_READ_BYTES)}）或 JPEG、PNG、GIF、WebP 图片（上限 ${formatBytes(MAX_IMAGE_FILE_BYTES)}）。` +
-      `文本支持起始行号 offset（从 1 开始）与最大读取行数 limit。图片忽略 offset/limit，会自动转正并等比缩放至 ` +
-      `${MAX_IMAGE_EDGE}x${MAX_IMAGE_EDGE} 以内（不裁剪、不放大），仅发送第一帧；读取图片需要支持视觉能力的模型。`,
+      `文本支持起始行号 offset（从 1 开始）与最大读取行数 limit（单次最多返回 ${MAX_READ_LINES} 行，超长内容会自动截断并提示续读 offset）。` +
+      `图片忽略 offset/limit，会自动转正并等比缩放至 ${MAX_IMAGE_EDGE}x${MAX_IMAGE_EDGE} 以内（不裁剪、不放大），仅发送第一帧；读取图片需要支持视觉能力的模型。`,
     inputSchema: z.object({
       file_path: z.string().min(1),
       offset: z.number().int().min(1).optional(),
-      limit: z.number().int().min(1).max(5000).optional(),
+      limit: z.number().int().min(1).max(MAX_READ_LINES).optional(),
     }),
     run: async ({ file_path, offset, limit }, { signal: sig }) => {
       sig?.throwIfAborted();
@@ -2117,7 +2118,7 @@ export function createReadTool(workspace: string) {
         }
         if (!isImage && size > MAX_READ_BYTES) {
           throw new Error(
-            `文件大小（${size} 字节）超过 ${formatBytes(MAX_READ_BYTES)} 上限，请改用 bash 工具（如 head/tail/rg）读取。`
+            `文件大小（${size} 字节）超过 ${formatBytes(MAX_READ_BYTES)} 上限，请改用 bash 工具（如 head/tail/grep）读取。`
           );
         }
       };
