@@ -80,7 +80,7 @@ export type AgentEvent =
   | { type: "tool_start"; id: string; name: string; input: unknown }
   | { type: "tool_progress"; id: string; name: string; text?: string; details?: unknown }
   | { type: "tool_end"; id: string; name: string; isError: boolean; outputSummary: string; details?: unknown }
-  | { type: "message"; message: AgentMessage }
+  | { type: "message"; message: Readonly<AgentMessage> }
   | { type: "compaction"; summary: string; estimatedTokensBefore: number; estimatedTokensAfter: number };
 
 /** 本次运行已取得完整响应的累计 Token 用量（含摘要请求；中断或失败的流不计入）。 */
@@ -117,8 +117,9 @@ export interface AgentOptions {
   thinking?: Anthropic.Messages.ThinkingConfigParam;
   signal?: AbortSignal;
   /**
-   * 每次发起主模型请求前（`turn = 0, 1, 2...`）调用，用于携带运行中产生的新数据（如用户中途纠偏队列、异步通知或环境增量）。
-   * 返回非空内容时会立即同步追加进 `messages`（并触发 `onEvent` 的 `message` 事件），即便随后取消也保留在返回快照中，队列可直接 `shift()` 消费。
+   * 每轮外层循环开始前调用，用于携带运行中产生的新数据（如用户中途纠偏队列、异步通知或环境增量）。
+   * 同一轮的恢复重试（超窗/thinking 签名失配）沿用本轮上下文，不重复拉取；`turn` 为此前已发起的主模型请求计数。
+   * 返回非空内容时会立即追加进 `messages`（并触发 `onEvent` 的 `message` 事件），即便随后取消也保留在返回快照中，队列可直接 `shift()` 消费。
    */
   getTurnContext?: (context: {
     turn: number;
@@ -240,6 +241,14 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
   }
 
   const emit = (event: AgentEvent) => emitEvent(onEvent, event);
+  const emitMessage = (msg: AgentMessage) => {
+    if (!onEvent) return;
+    let snapshot = msg;
+    try {
+      snapshot = structuredClone(msg);
+    } catch {}
+    emit({ type: "message", message: snapshot });
+  };
   const addUsage = (u: Usage) => {
     usage.inputTokens += u.input_tokens;
     usage.outputTokens += u.output_tokens;
@@ -248,14 +257,14 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
   };
   const appendMessage = (msg: AgentMessage) => {
     messages.push(msg);
-    emit({ type: "message", message: msg });
+    emitMessage(msg);
   };
 
   try {
     // 1. 入口一次性归一化：修补历史中悬空的 tool_use，并校验所有 tool_result 配对合法
     const repaired = repairMessages(messages);
     messages = repaired.messages;
-    if (repaired.appendedTail) emit({ type: "message", message: repaired.appendedTail });
+    if (repaired.appendedTail) emitMessage(repaired.appendedTail);
 
     const fixedInputTokens =
       estimateText(systemPrompt) +
@@ -872,18 +881,35 @@ function serializeContentForSummary(content: unknown): string {
   return JSON.stringify(block);
 }
 
-/** 按最大字符上限对超长序列化历史做头尾保留截断，确保单次摘要请求绝不超窗。 */
+/** 在估算 Token 预算内二分截取头尾并拼接省略标记，确保截断结果按相同字节单位不超过 `maxTokens`。 */
 function clampTextMiddle(text: string, maxTokens: number): string {
   if (estimateText(text) <= maxTokens) return text;
-  const maxChars = Math.max(256, maxTokens * 2);
-  if (text.length <= maxChars) return text;
-  const headChars = Math.floor(maxChars * 0.4);
-  const tailChars = maxChars - headChars;
-  const head = sliceStringSafe(text, headChars);
-  let tailStart = text.length - tailChars;
+  const marker = "\n\n... [中间部分历史因超出摘要窗口已省略] ...\n\n";
+  const bodyBudget = Math.max(0, maxTokens - estimateText(marker) - 4);
+  const headBudget = Math.floor(bodyBudget * 0.4);
+  const tailBudget = bodyBudget - headBudget;
+
+  let low = 0;
+  let high = text.length;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (estimateText(text.slice(0, mid)) <= headBudget) low = mid;
+    else high = mid - 1;
+  }
+  const head = sliceStringSafe(text, low);
+
+  low = 0;
+  high = text.length - head.length;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (estimateText(text.slice(text.length - mid)) <= tailBudget) low = mid;
+    else high = mid - 1;
+  }
+  let tailStart = text.length - low;
   const code = text.charCodeAt(tailStart);
   if (code >= 0xdc00 && code <= 0xdfff) tailStart++;
-  return `${head}\n\n... [中间部分历史因超出摘要窗口已省略] ...\n\n${text.slice(tailStart)}`;
+
+  return `${head}${marker}${text.slice(tailStart)}`;
 }
 
 /**
@@ -970,8 +996,15 @@ async function compactMessages(options: {
   }
 
   const summarySystem = `${SUMMARY_SYSTEM}摘要正文控制在 ${summaryTextBudget} Token 以内。`;
-  const maxSummaryInputTokens = contextWindow - safetyTokens - summaryOutputBudget - estimateText(summarySystem) - 64;
-  if (maxSummaryInputTokens < 256) {
+  const summaryPromptPrefix = "待总结的对话历史：\n\n";
+  const maxHistoryTokens =
+    contextWindow -
+    safetyTokens -
+    summaryOutputBudget -
+    estimateText(summarySystem) -
+    estimateText(summaryPromptPrefix) -
+    64;
+  if (maxHistoryTokens < 128) {
     throw new Error("模型窗口不足以发起上下文摘要请求。");
   }
 
@@ -979,7 +1012,10 @@ async function compactMessages(options: {
     .slice(0, cut)
     .map((m) => `[${m.role}]\n${serializeContentForSummary(m.content)}`)
     .join("\n\n");
-  const summaryPrompt = `待总结的对话历史：\n\n${clampTextMiddle(serializedHistory, maxSummaryInputTokens)}`;
+  const summaryPrompt = summaryPromptPrefix + clampTextMiddle(serializedHistory, maxHistoryTokens);
+  if (estimateText(summarySystem) + estimateText(summaryPrompt) + summaryOutputBudget + safetyTokens > contextWindow) {
+    throw new Error("摘要请求超出模型上下文窗口预算。");
+  }
 
   const response = await client.messages
     .stream(
@@ -1122,6 +1158,15 @@ function sendProcessGroupSignal(pid: number | undefined, sig: NodeJS.Signals): v
   } catch {}
 }
 
+function isProcessGroupAlive(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (err) {
+    return errnoCode(err) === "EPERM";
+  }
+}
+
 export interface BashRunOptions {
   env?: NodeJS.ProcessEnv;
   signal?: AbortSignal;
@@ -1200,6 +1245,7 @@ export function runBashProcessGroup(
     let settled = false;
     let timeoutTimer: NodeJS.Timeout | undefined;
     let graceTimer: NodeJS.Timeout | undefined;
+    let groupPollTimer: NodeJS.Timeout | undefined;
 
     const finish = (spawnErr?: Error) => {
       if (settled) return;
@@ -1208,6 +1254,7 @@ export function runBashProcessGroup(
 
       clearTimeout(timeoutTimer);
       clearTimeout(graceTimer);
+      clearInterval(groupPollTimer);
       signal?.removeEventListener("abort", onAbort);
 
       const remOut = stdoutDecoder.end();
@@ -1235,6 +1282,11 @@ export function runBashProcessGroup(
       clearTimeout(timeoutTimer);
       clearTimeout(graceTimer);
       sendProcessGroupSignal(pid, "SIGTERM");
+      // 终止期间保留完整 SIGTERM 宽限，同时按需检查进程组是否已全部退出以避免无谓等待
+      groupPollTimer = setInterval(() => {
+        if (!pid || !isProcessGroupAlive(pid)) finish();
+      }, 40);
+      groupPollTimer.unref?.();
       graceTimer = setTimeout(() => finish(), KILL_GRACE_MS);
     };
 
@@ -1256,7 +1308,9 @@ export function runBashProcessGroup(
     child.on("close", (code, sig) => {
       if (exitCode === null) exitCode = code;
       if (exitSignal === null) exitSignal = sig;
-      finish();
+      if (stopMode === "none" || !pid || !isProcessGroupAlive(pid)) {
+        finish();
+      }
     });
   });
 }
@@ -1333,6 +1387,7 @@ async function atomicWriteFile(targetPath: string, content: string, signal?: Abo
   try {
     signal?.throwIfAborted();
     await fs.writeFile(tmpPath, content, { encoding: "utf-8", mode, flag: "wx", signal });
+    if (existing) await fs.chmod(tmpPath, mode);
     signal?.throwIfAborted();
     await fs.rename(tmpPath, targetPath);
     committed = true;
@@ -1363,17 +1418,31 @@ function isSupportedImage(head: Buffer): boolean {
   );
 }
 
-/** 读取并按需缩放图片：合规静态小图直接发送，超尺寸/带方向/多帧图片自动取首帧转正并缩放至 2000px 内。 */
+/** 扫描首个 `IDAT` 前是否存在 `acTL` 块，区分静态 PNG 与 APNG 动图。 */
+function isStaticPng(buf: Buffer): boolean {
+  let offset = 8;
+  while (offset + 8 <= buf.length) {
+    const length = buf.readUInt32BE(offset);
+    const type = buf.toString("latin1", offset + 4, offset + 8);
+    if (type === "acTL") return false;
+    if (type === "IDAT") return true;
+    offset += 12 + length;
+  }
+  return false;
+}
+
+/** 读取并按需缩放图片：合规静态小图经真实解码校验后直接发送，超尺寸/带方向/动图自动取首帧转正并缩放至 2000px 内。 */
 async function readImage(buf: Buffer, filePath: string, signal?: AbortSignal): Promise<ToolOutput> {
   const sharp = (await import("sharp")).default;
   signal?.throwIfAborted();
 
   const b64Len = (byteLength: number) => 4 * Math.ceil(byteLength / 3);
-  const meta = await sharp(buf, { limitInputPixels: MAX_IMAGE_PIXELS }).metadata();
+  const image = sharp(buf, { limitInputPixels: MAX_IMAGE_PIXELS, failOn: "warning" });
+  const meta = await image.metadata();
   signal?.throwIfAborted();
 
   const format = meta.format;
-  if (
+  const canPassThrough =
     (format === "jpeg" || format === "png" || format === "webp" || format === "gif") &&
     (meta.width ?? 0) > 0 &&
     (meta.height ?? 0) > 0 &&
@@ -1381,8 +1450,12 @@ async function readImage(buf: Buffer, filePath: string, signal?: AbortSignal): P
     meta.height! <= MAX_IMAGE_EDGE &&
     (meta.orientation ?? 1) === 1 &&
     (meta.pages ?? 1) === 1 &&
-    b64Len(buf.length) <= MAX_IMAGE_BASE64_CHARS
-  ) {
+    (format !== "png" || isStaticPng(buf)) &&
+    b64Len(buf.length) <= MAX_IMAGE_BASE64_CHARS;
+
+  if (canPassThrough) {
+    await image.clone().raw().toBuffer(); // 完整解码校验像素数据，防止损坏图片绕过 metadata 检查进入上下文
+    signal?.throwIfAborted();
     const mediaType = `image/${format}` as const;
     return [
       { type: "text", text: `已读取图片 ${filePath}（${meta.width}x${meta.height}，${mediaType}）。` },
@@ -1390,7 +1463,7 @@ async function readImage(buf: Buffer, filePath: string, signal?: AbortSignal): P
     ];
   }
 
-  const pipeline = sharp(buf, { pages: 1, page: 0, limitInputPixels: MAX_IMAGE_PIXELS })
+  const pipeline = sharp(buf, { pages: 1, page: 0, limitInputPixels: MAX_IMAGE_PIXELS, failOn: "warning" })
     .autoOrient()
     .resize({ width: MAX_IMAGE_EDGE, height: MAX_IMAGE_EDGE, fit: "inside", withoutEnlargement: true });
 
@@ -1464,20 +1537,40 @@ function formatReadText(decodedText: string, offset?: number, limit?: number): s
   return numbered;
 }
 
-/** 单处精确文本替换（兼容 CRLF 文件换行风格，要求唯一定位）。 */
+/** 查找不从中间劈开 `"\r\n"` 的匹配起点（最多收集 2 处以判定唯一性）。 */
+function findMatchesSafe(content: string, needle: string): number[] {
+  const matches: number[] = [];
+  let from = 0;
+  while (from <= content.length - needle.length) {
+    const idx = content.indexOf(needle, from);
+    if (idx === -1) break;
+    const splitsLeading = needle.startsWith("\n") && idx > 0 && content[idx - 1] === "\r";
+    const splitsTrailing =
+      needle.endsWith("\r") && idx + needle.length < content.length && content[idx + needle.length] === "\n";
+    if (!splitsLeading && !splitsTrailing) {
+      matches.push(idx);
+      if (matches.length > 1) break;
+    }
+    from = idx + 1;
+  }
+  return matches;
+}
+
+/** 单处精确文本替换（兼容 CRLF 文件换行风格，防跨边界劈开 `\r\n`，要求唯一定位）。 */
 function applySingleEdit(rawContent: string, oldText: string, newText: string, filePath: string): string {
   const isPureCrLf = rawContent.includes("\r\n") && !rawContent.replaceAll("\r\n", "").includes("\n");
   const haystack = isPureCrLf ? rawContent.replaceAll("\r\n", "\n") : rawContent;
   const needle = isPureCrLf ? oldText.replaceAll("\r\n", "\n") : oldText;
   const replacement = isPureCrLf ? newText.replaceAll("\r\n", "\n") : newText;
 
-  const first = haystack.indexOf(needle);
-  if (first === -1) {
+  const matches = findMatchesSafe(haystack, needle);
+  if (matches.length === 0) {
     throw new Error(`在 ${filePath} 中未匹配到指定的 old_text。请先用 read 确认精确原文。`);
   }
-  if (haystack.indexOf(needle, first + 1) !== -1) {
+  if (matches.length > 1) {
     throw new Error(`old_text 在 ${filePath} 中命中多处。请补充更多前后上下文行以唯一定位。`);
   }
+  const first = matches[0];
   const updated = haystack.slice(0, first) + replacement + haystack.slice(first + needle.length);
   if (updated === haystack) {
     throw new Error(`编辑未对 ${filePath} 产生任何改动：替换后的内容与原文件完全一致。`);
